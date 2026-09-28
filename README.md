@@ -10,10 +10,13 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 
 ### Section 1: (Not started)
 ### Section 2: Backend Communication Design Patterns
-- **Progress:** 0 / 11 lectures | 3hr 26min total
+- **Progress:** 1 / 11 lectures | 3hr 26min total
+- **Completed:** Lecture 6 — Backend Communication Design Patterns Intro ✅
+- **Current:** Lecture 7 — Request Response
+- **Remaining:** 10 lectures
 - **Lectures:**
-  1. [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
-  2. [7. Request Response](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-07-request-response.md) (28min)
+  1. ✅ [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
+  2. 🔄 [7. Request Response](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-07-request-response.md) (28min)
   3. [8. Push](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-08-push.md) (20min)
   4. [9. Synchronous vs Asynchronous workloads](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) (43min)
   5. [10. Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) (14min)
@@ -36,3 +39,14 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 > Don't just finish the course. Become a better backend/full-stack engineer.
 
 Understand the **why**, not just the **what**. Build strong mental models. Connect concepts to real-world applications.
+
+## Key Mental Model (From Lecture 6)
+
+**Each pattern answers a different engineering problem.** Don't compete patterns — categorize them:
+- **Communication**: Request/Response, Polling, Long Polling, SSE, Push
+- **Messaging/Distribution**: Pub/Sub
+- **Architecture/State**: Stateful, Stateless
+- **Transport/Connection**: Multiplexing
+- **Deployment**: Sidecar
+
+> **"What problem am I solving, and what trade-offs am I willing to accept?"**
