@@ -248,9 +248,154 @@ sequenceDiagram
 
 ---
 
-## When Request/Response Is the Wrong Tool
+## When Request/Response Is the Wrong Tool — Deep Dive
 
-We identified the **failure modes** that drive the next lectures:
+We identified the **failure modes** that drive the next lectures. Each failure mode reveals a fundamental mismatch between what Request/Response assumes and what the situation requires.
+
+### The Core Assumption of Request/Response
+
+> **Request/Response assumes the CLIENT drives the interaction.** The client knows what it wants, when to ask, and can wait for the answer.
+
+When this assumption breaks, the pattern fights you.
+
+---
+
+### Failure Mode 1: Server Has Info, Client Doesn't Know to Ask (The Notification Problem)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  USER A uploads video                                            │
+│       │                                                         │
+│       ▼                                                         │
+│  BACKEND: "Video uploaded!" ──needs to notify──► USER B          │
+│                                                                  │
+│  PROBLEM: User B's client doesn't know to ask                   │
+│           "Hey, any new videos?"                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Request/Response workaround**: Polling
+```
+Client: "Any notifications?" → Server: "No"
+Client: "Any notifications?" → Server: "No"  
+Client: "Any notifications?" → Server: "Yes! Here's one"
+```
+
+**Why it fails**: 
+- Wasted requests (99% empty responses)
+- Latency = polling interval
+- Doesn't scale (10K clients polling = 10K requests/sec)
+
+**Patterns that solve it**: **Push / SSE / WebSocket** (Lectures 8, 12)
+
+---
+
+### Failure Mode 2: Long-Running Operations Exceed Client Timeout
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Client: POST /process-video (5GB file)                         │
+│       │                                                         │
+│       ▼                                                         │
+│  Server: Processing... 30 seconds... 60 seconds... 120 seconds  │
+│       │                                                         │
+│       ▼                                                         │
+│  Client: ⏱️ TIMEOUT (default 30-60s)                            │
+│       │                                                         │
+│       ▼                                                         │
+│  Client: RETRIES → Duplicate work!                              │
+│  Server: Still processing original...                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why it fails**:
+- Client can't wait indefinitely
+- Retries cause duplicate processing
+- No way for client to know "still working" vs "failed"
+
+**Patterns that solve it**: **Async + Callback / Webhook / Polling** (Lecture 9)
+
+---
+
+### Failure Mode 3: Chatty Clients (N+1 Requests)
+
+```
+REST: One resource = one endpoint = one request
+
+Client needs: User + Posts + Comments + Followers
+              │
+              ├── GET /users/5
+              ├── GET /users/5/posts
+              ├── GET /users/5/comments  
+              └── GET /users/5/followers
+              
+= 4 round-trips, 4x latency, 4x connection overhead
+```
+
+**GraphQL helps** but still Request/Response — just moves chattiness to backend.
+
+**Patterns that solve it**: **GraphQL / Batching** (this lecture)
+
+---
+
+### Failure Mode 4: Large Data Transfer = Fragile
+
+```
+7GB upload → 90% complete → Network blip → CONNECTION RESET
+
+Result: 6.3GB wasted, start from zero
+```
+
+**Chunked upload extends the pattern** but adds complexity (state tracking, resume logic).
+
+**Patterns that solve it**: **Chunked / Resumable** (pattern extension)
+
+---
+
+### Failure Mode 5: High-Frequency Updates
+
+```
+Stock ticker: Price changes 100x/second
+Chat app: Messages every few seconds
+Live dashboard: Metrics updating constantly
+
+Polling: "Any updates?" 100x/sec = DDoS yourself
+Request/Response: Wrong direction (client pulls, server pushes)
+```
+
+**Patterns that solve it**: **Pub/Sub / WebSocket** (Lecture 13)
+
+---
+
+### Failure Mode 6: Massive Concurrent Connections
+
+```
+10,000 clients connected simultaneously
+Thread-per-request = 10,000 threads = OOM / context switch hell
+```
+
+**Patterns that solve it**: **Multiplexing / async I/O / event loop** (Lecture 14)
+
+---
+
+## The Pattern-First Mapping
+
+| Failure Mode | Why Request/Response Fails | Pattern That Solves It |
+|--------------|---------------------------|------------------------|
+| **Server has event, client doesn't know to ask** | Client must poll ("Anything? No. Anything? No.") | **Push / SSE / WebSocket** (Lectures 8, 12) |
+| **Operation exceeds client timeout** | Client hangs, retries, duplicates work | **Async + callback/polling** (Lecture 9) |
+| **Client needs many related resources** | N+1 requests, head-of-line blocking | **GraphQL / Batching** (this lecture) |
+| **Large/unreliable transfer** | Failure = total loss, no resume | **Chunked / Resumable** (pattern extension) |
+| **High-frequency updates** | Polling wastes resources, wrong direction | **Pub/Sub / WebSocket** (Lecture 13) |
+| **Massive concurrent connections** | Thread-per-request doesn't scale | **Multiplexing / async I/O** (Lecture 14) |
+
+---
+
+**This is the pattern-first thinking**: Don't ask "which technology?" Ask **"which failure mode am I hitting?"**
+
+---
+
+## When Request/Response Is the Wrong Tool (Summary)
 
 | Failure Mode | Why Request/Response Fails | Next Pattern |
 |--------------|---------------------------|--------------|
