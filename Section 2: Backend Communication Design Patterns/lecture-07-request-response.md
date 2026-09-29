@@ -10,55 +10,33 @@
 
 The pattern looks trivial: client asks, server answers. But every request carries **hidden costs at every layer**:
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                     THE FULL REQUEST/RESPONSE CYCLE                     │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  CLIENT                          NETWORK                          SERVER│
-│  ──────                          ────────                          ─────│
-│                                                                         │
-│  1. SERIALIZE                                                          │
-│     Domain object → wire format (JSON/protobuf)                        │
-│        │                                                               │
-│        ▼                                                               │
-│  2. FRAME & WRITE REQUEST                                              │
-│     Add protocol headers, delimiters, boundary markers                 │
-│        │                                                               │
-│        ▼                                                               │
-│  3. TCP CONNECTION (if new)                                            │
-│     SYN → SYN-ACK → ACK                                                │
-│        │                                                               │
-│        ▼                                                               │
-│  4. TRANSMIT ──────────────────────────────────►                       │
-│     TCP segments → IP packets → routing → reordering                   │
-│        │                                                               │
-│        ▼                                                               │
-│  5. REASSEMBLE & PARSE BOUNDARIES                                      │
-│     Reorder segments → find request START and END                      │
-│        │                                                               │
-│        ▼                                                               │
-│  6. DESERIALIZE                                                        │
-│     Wire bytes → internal data structures                              │
-│        │                                                               │
-│        ▼                                                               │
-│  7. PROCESS (the "visible" work)                                       │
-│     Auth → validation → DB query → business logic                      │
-│        │                                                               │
-│        ▼                                                               │
-│  8. SERIALIZE RESPONSE                                                 │
-│        │                                                               │
-│        ▼                                                               │
-│  9. TRANSMIT ◄──────────────────────────────────                       │
-│        │                                                               │
-│        ▼                                                               │
-│ 10. PARSE & DESERIALIZE                                                │
-│        │                                                               │
-│        ▼                                                               │
-│ 11. CONSUME                                                            │
-│     Use data → maybe trigger next request                              │
-│                                                                         │
-└────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Client["CLIENT"]
+        S1[1. SERIALIZE<br/>Domain object → wire format<br/>(JSON/protobuf)]
+        S2[2. FRAME & WRITE REQUEST<br/>Add protocol headers, delimiters,<br/>boundary markers]
+        S3[3. TCP CONNECTION<br/>(if new)<br/>SYN → SYN-ACK → ACK]
+        S10[10. PARSE & DESERIALIZE]
+        S11[11. CONSUME<br/>Use data → maybe trigger<br/>next request]
+    end
+
+    subgraph Network["NETWORK"]
+        N1[4. TRANSMIT<br/>TCP segments → IP packets<br/>→ routing → reordering]
+        N2[9. TRANSMIT<br/>Response packets → routing<br/>→ reordering]
+    end
+
+    subgraph Server["SERVER"]
+        S5[5. REASSEMBLE & PARSE BOUNDARIES<br/>Reorder segments → find request<br/>START and END]
+        S6[6. DESERIALIZE<br/>Wire bytes → internal<br/>data structures]
+        S7[7. PROCESS<br/>"visible" work:<br/>Auth → validation → DB → logic]
+        S8[8. SERIALIZE RESPONSE]
+    end
+
+    S1 --> S2 --> S3 --> N1 --> S5 --> S6 --> S7 --> S8 --> N2 --> S10 --> S11
+
+    style Client fill:#e3f2fd,stroke:#1976d2
+    style Network fill:#fff3e0,stroke:#f57c00
+    style Server fill:#e8f5e9,stroke:#388e3c
 ```
 
 **Key insight**: Most engineers only think about step 7. **Steps 1-6 and 8-11 are where performance lives or dies.**
@@ -109,23 +87,21 @@ We clarified this distinction because the lecture (and many engineers) blur them
 
 We traced the industry progression and the **engineering reasoning** behind each shift:
 
-```
-SOAP/XML (enterprise standard)
-    │
-    │ Problem: XML parsing is EXPENSIVE (DOM tree, namespaces, validation)
-    │          Verbose on wire (angle brackets everywhere)
-    ▼
-REST/JSON (web standard)
-    │
-    │ Problem: JSON still parses character-by-character
-    │          Human-readable = larger payloads
-    │          No schema enforcement
-    ▼
-gRPC/Protocol Buffers (high-performance)
-    │
-    │ Binary, length-prefixed, schema-enforced
-    │ 10-100x faster parsing
-    │ Not human-readable (tooling required)
+```mermaid
+flowchart TD
+    XML[SOAP/XML<br/>Enterprise standard]
+    JSON[REST/JSON<br/>Web standard]
+    PROTO[gRPC/Protocol Buffers<br/>High-performance]
+
+    XML -->|Problem: XML parsing EXPENSIVE<br/>DOM tree, namespaces, validation<br/>Verbose on wire| JSON
+    JSON -->|Problem: JSON parses char-by-char<br/>Human-readable = larger payloads<br/>No schema enforcement| PROTO
+
+    PROTO -.->|Binary, length-prefixed<br/>Schema-enforced<br/>10-100x faster parsing<br/>Not human-readable| Tooling[Requires tooling]
+
+    style XML fill:#ffcdd2,stroke:#c62828
+    style JSON fill:#fff9c4,stroke:#fbc02d
+    style PROTO fill:#c8e6c9,stroke:#388e3c
+    style Tooling fill:#e1bee7,stroke:#8e24aa
 ```
 
 **Critical insight**: JavaScript has a **native advantage** with JSON because `JSON.parse()` is implemented in the engine (C++), not userland. In C++/Go/Java, you pay the full parsing cost.
@@ -155,16 +131,31 @@ We mapped the pattern across the **entire stack** — it's not just HTTP:
 
 We discussed why GraphQL exists and what it actually solves:
 
-**REST's problem**: Resource-oriented = one endpoint per resource = chatty clients
-```
-GET /users/5           → {id: 5, name: "Bob"}
-GET /users/5/posts     → [{id: 1, ...}, {id: 2, ...}]
-GET /users/5/comments  → [{id: 10, ...}]
-```
+```mermaid
+sequenceDiagram
+    participant Client
+    participant REST_API as REST API
+    participant GraphQL_API as GraphQL API
+    participant Backend as Backend Services
+    participant DB as Database
 
-**GraphQL's solution**: Client specifies **exactly what it needs** in one request
-```
-query { user(id:5) { name, posts { title }, comments { text } } }
+    Note over Client,REST_API: REST — Chatty (N+1 round-trips)
+    Client->>REST_API: GET /users/5
+    REST_API-->>Client: {id: 5, name: "Bob"}
+    Client->>REST_API: GET /users/5/posts
+    REST_API-->>Client: [{id: 1, ...}, {id: 2, ...}]
+    Client->>REST_API: GET /users/5/comments
+    REST_API-->>Client: [{id: 10, ...}]
+
+    Note over Client,GraphQL_API: GraphQL — Single round-trip
+    Client->>GraphQL_API: query { user(id:5) { name, posts, comments } }
+    GraphQL_API->>Backend: Resolve user
+    Backend->>DB: SELECT * FROM users WHERE id=5
+    GraphQL_API->>Backend: Resolve posts (batched)
+    Backend->>DB: SELECT * FROM posts WHERE user_id=5
+    GraphQL_API->>Backend: Resolve comments (batched)
+    Backend->>DB: SELECT * FROM comments WHERE user_id=5
+    GraphQL_API-->>Client: { user: { name, posts, comments } }
 ```
 
 **But here's the key**: GraphQL doesn't eliminate the multiple queries — it **moves them from the network layer to the backend layer**. The backend can now:
@@ -181,16 +172,27 @@ query { user(id:5) { name, posts { title }, comments { text } } }
 
 Hussein's timeline breaks down where time actually goes:
 
-```
-T-2 ────── T0 ────────────── T2 ────────────── T30 ────────────── T32
-  │            │                │                  │                  │
-  ▼            ▼                ▼                  ▼                  ▼
-Client       Network         Server            Server          Client
-writes       transfer          parses            processes       receives
-request      (segments,        boundaries,       response,       response
-             packets,          deserializes,     serializes
-             routing,          executes
-             reordering)
+```mermaid
+gantt
+    title Request/Response Timeline — Hidden Costs
+    dateFormat  X
+    axisFormat  %S
+
+    section Client
+    Serialize & Frame     :crit, t1, 0, 2
+    Write Request         :crit, t2, 2, 2
+    Receive Response      :crit, t5, 30, 2
+    Parse & Deserialize   :crit, t6, 32, 2
+
+    section Network
+    Request Transfer      :crit, net1, 2, 2
+    Response Transfer     :crit, net2, 30, 2
+
+    section Server
+    Parse Boundaries      :crit, s1, 2, 5
+    Deserialize           :crit, s2, 7, 3
+    Process (DB, Logic)   :crit, s3, 10, 20
+    Serialize Response    :crit, s4, 30, 2
 ```
 
 **Each segment has distinct costs:**
@@ -207,19 +209,33 @@ request      (segments,        boundaries,       response,       response
 
 We analyzed the image upload example as a **pattern extension**, not a new pattern:
 
-**Naive approach**: One giant request
-- Fails at size limits (nginx `client_max_body_size`, cloud LB limits)
-- Failure at 90% = total loss, no resume
-- Memory pressure on server (buffering entire payload)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
 
-**Chunked approach**: Multiple requests with coordination
-```
-POST /upload/init     → {upload_id: "abc", chunk_size: 5MB}
-POST /upload/abc/1    → chunk 1 bytes
-POST /upload/abc/2    → chunk 2 bytes
-...
-POST /upload/abc/7    → chunk 7 (final)
-POST /upload/abc/done → server assembles, validates, processes
+    Note over Client,Server: Naive: One giant request → fragile
+    Note over Client,Server: Chunked: Multiple requests with coordination
+
+    Client->>Server: POST /upload/init
+    Server-->>Client: {upload_id: "abc", chunk_size: 5MB}
+
+    par Parallel chunks (optional)
+        Client->>Server: POST /upload/abc/1 (chunk 1)
+        Server-->>Client: 200 OK
+        Client->>Server: POST /upload/abc/2 (chunk 2)
+        Server-->>Client: 200 OK
+        Client->>Server: POST /upload/abc/3 (chunk 3)
+        Server-->>Client: 200 OK
+    end
+
+    Client->>Server: POST /upload/abc/7 (final chunk)
+    Server-->>Client: 200 OK
+    Client->>Server: POST /upload/abc/done
+    Server-->>Client: {status: "assembled", file_id: "xyz"}
+
+    Note over Server: Server tracks state:<br/>"Got chunks 1-3 of 7"
+    Note over Client,Server: If disconnect → resume from chunk 4
 ```
 
 **Why this works**:
