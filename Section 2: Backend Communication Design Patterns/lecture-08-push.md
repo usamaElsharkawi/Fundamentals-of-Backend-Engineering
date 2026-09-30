@@ -174,7 +174,10 @@ flowchart LR
     S -->|"buffers fill"| B["Kernel socket buffer"]
     B -->|"overflows"| D["Data dropped<br/>or client crashes"]
     C -.->|"I can't keep up!"| S
-    Note right of S: ⚠️ Server has no<br/>feedback channel here
+    N["⚠️ Server has no<br/>feedback channel here"]
+    S -.- N
+
+    style N fill:#ffcdd2,stroke:#c62828,stroke-dasharray: 4 3
 ```
 
 **The mechanism in Request/Response:** the client pulls. It only asks again when it has capacity. **The rate limiter IS the client.**
@@ -367,8 +370,10 @@ flowchart TB
     C2["Client B"] <-->|"connected"| S
     C3["Client C"] <-->|"connected"| S
     S -->|"loops over connections<br/>and broadcasts"| OUT["everyone receives"]
+    N["Clients never talk to each other.<br/>The server owns all fan-out."]
+    S -.- N
 
-    Note bottom of S: Clients never talk to each other.<br/>The server owns all fan-out.
+    style N fill:#fff3e0,stroke:#f57c00,stroke-dasharray: 4 3
 ```
 
 **Checkpoint:** Why can't clients A and B send messages directly to each other in this design? Is that a limitation of push?
