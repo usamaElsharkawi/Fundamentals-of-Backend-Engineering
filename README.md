@@ -10,14 +10,14 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 
 ### Section 1: (Not started)
 ### Section 2: Backend Communication Design Patterns
-- **Progress:** 2 / 11 lectures | 3hr 26min total
-- **Completed:** Lecture 6 — Backend Communication Design Patterns Intro ✅, Lecture 7 — Request Response ✅
-- **Current:** Lecture 8 — Push
-- **Remaining:** 9 lectures
+- **Progress:** 3 / 11 lectures | 3hr 26min total
+- **Completed:** Lecture 6 — Intro ✅, Lecture 7 — Request Response ✅, Lecture 8 — Push ✅
+- **Current:** Lecture 9 — Synchronous vs Asynchronous Workloads
+- **Remaining:** 8 lectures
 - **Lectures:**
   1. ✅ [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
   2. ✅ [7. Request Response](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-07-request-response.md) (28min)
-  3. 🔄 [8. Push](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-08-push.md) (20min)
+  3. ✅ [8. Push](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-08-push.md) (20min)
   4. [9. Synchronous vs Asynchronous workloads](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) (43min)
   5. [10. Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) (14min)
   6. [11. Long Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) (10min)
