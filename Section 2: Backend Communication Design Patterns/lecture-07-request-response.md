@@ -1,482 +1,634 @@
-# Lecture 7: Request Response — Complete Lesson
+# Lecture 7: Request / Response — Built Up, Unit by Unit
 
 ## Status: Completed ✅
 
+> **How to read this doc:** Each unit builds on the previous one. Don't skip. Units 1–2 are the foundation; if those are shaky, nothing after them will make sense. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
+
 ---
 
-## The Core Mental Model We Built
+## Unit 0 — The Whole Lecture in One Sentence
 
-### Request/Response Is Not "Simple" — It's Deceptively Complex
+**A client asks a question, a server answers it, and nothing happens until someone asks again.**
 
-The pattern looks trivial: client asks, server answers. But every request carries **hidden costs at every layer**:
+That's it. That's Request/Response.
+
+Everything in this lecture is an answer to one question: *what actually happens during those two arrows?*
+
+---
+
+## Unit 1 — The Core Loop
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: Request
+    Note right of S: Server reads it
+    S->>S: Does the work
+    S-->>C: Response
+    Note left of C: Client reads it
+    Note over C,S: ...nothing happens until the next request
+```
+
+Two properties define this pattern:
+
+| Property | Meaning |
+|---|---|
+| **Client-initiated** | The *client* decides when communication happens. The server never starts a conversation. |
+| **Stateless by default** | Each request stands alone. Request #2 knows nothing about request #1. |
+
+**Why this matters immediately:** everything that later looks "hard" (polling, long polling, push, WebSockets) is an attempt to *break one of these two properties*. Keep this in mind — it explains the entire rest of the section.
+
+---
+
+## Unit 2 — What a Request Actually *Is*
+
+This is where most people's mental model breaks, so let's fix it first.
+
+**Common (wrong) mental model:**
+```
+Request = a structured object like { method: "GET", path: "/users" }
+```
+
+**What's actually true:**
+```
+Request = a stream of BYTES on a socket, with a FORMAT that says how to read them
+```
+
+A request is not an object. It's **bytes**. The structure you see in code (`req.method`, `req.path`) only exists *after* something reads those bytes and interprets them using a format. That "something" is a **parser**, and the format is the **protocol**.
+
+So there are always two separate things:
+
+| Layer | Question it answers | Example |
+|---|---|---|
+| **Protocol / Framing** | *Where does a message start and end?* | HTTP headers + blank line |
+| **Message Format** | *What do the bytes inside mean?* | JSON, XML, Protobuf |
+
+**Checkpoint:** If a request is just bytes, what happens if the server has no idea where one request ends and the next begins?
+
+---
+
+## Unit 3 — The Boundary Problem
+
+This is the most important unit in the lecture. If you get this, you understand something most working engineers never explicitly think about.
+
+**The situation:** TCP gives you a **pipe of bytes**. It does not preserve your messages.
+
+```mermaid
+flowchart LR
+    subgraph Sender["What the client sent"]
+        A["GET /a HTTP/1.1..."] 
+        B["POST /b HTTP/1.1..."]
+    end
+    subgraph Receiver["What the server receives"]
+        C["G E T _ / a H T T P..."]
+    end
+    Sender -->|"network may split, merge, reorder"| Receiver
+```
+
+The server receives:
+```
+G E T _ / a H T T P / 1 . 1 \r \n H o s t : x \r \n \r \n P O S T _ / b H T T P...
+```
+
+**One continuous flow of bytes.** No messages. No markers. The server cannot tell:
+- Where request #1 starts
+- Where request #1 **ends** and request #2 **begins**
+- Whether this is 2 requests, or 1 giant malformed one
+
+**Why it's hard:** TCP is free to split, merge, and reorder. A message can be split across packets, and multiple messages can arrive in one packet. The protocol must therefore define its own boundaries — the network will never do it for you.
+
+> **This is why parsing is real work, and why "the cost of parsing a request is not cheap."** The server is running a state machine, byte by byte, to find structure.
+
+**Checkpoint:** You have a TCP connection carrying bytes. The client sends 3 requests back to back. How does the server know it got 3 and not 1 giant one?
+
+---
+
+## Unit 4 — Framing: How Protocols Solve It
+
+**Framing** = the technique a protocol uses to mark message boundaries in a byte stream.
+
+Every protocol picks one:
 
 ```mermaid
 flowchart TB
-    subgraph Client["CLIENT"]
-        S1[1. SERIALIZE<br/>Domain object → wire format<br/>(JSON/protobuf)]
-        S2[2. FRAME & WRITE REQUEST<br/>Add protocol headers, delimiters,<br/>boundary markers]
-        S3[3. TCP CONNECTION<br/>(if new)<br/>SYN → SYN-ACK → ACK]
-        S10[10. PARSE & DESERIALIZE]
-        S11[11. CONSUME<br/>Use data → maybe trigger<br/>next request]
-    end
+    ROOT["How to mark boundaries<br/>in a byte stream?"]
 
-    subgraph Network["NETWORK"]
-        N1[4. TRANSMIT<br/>TCP segments → IP packets<br/>→ routing → reordering]
-        N2[9. TRANSMIT<br/>Response packets → routing<br/>→ reordering]
-    end
+    ROOT --> A["1. Length prefix<br/>Read N bytes → that's the message"]
+    ROOT --> B["2. Delimiter<br/>Read until a special marker"]
+    ROOT --> C["3. Fixed size<br/>Always exactly N bytes"]
+    ROOT --> D["4. Self-describing structure<br/>(e.g. text headers + blank line)"]
 
-    subgraph Server["SERVER"]
-        S5[5. REASSEMBLE & PARSE BOUNDARIES<br/>Reorder segments → find request<br/>START and END]
-        S6[6. DESERIALIZE<br/>Wire bytes → internal<br/>data structures]
-        S7[7. PROCESS<br/>"visible" work:<br/>Auth → validation → DB → logic]
-        S8[8. SERIALIZE RESPONSE]
-    end
+    A --> A1["Protocol Buffers, gRPC frames,<br/>Redis RESP, most binary protocols"]
+    B --> B1["SMTP (blank line ends message),<br/>line protocols, some custom formats"]
+    C --> C1["DNS header (fixed 12 bytes),<br/>fixed-width records"]
+    D --> D1["HTTP/1.1 — read lines until<br/>blank line, then Content-Length"]
 
-    S1 --> S2 --> S3 --> N1 --> S5 --> S6 --> S7 --> S8 --> N2 --> S10 --> S11
-
-    style Client fill:#e3f2fd,stroke:#1976d2
-    style Network fill:#fff3e0,stroke:#f57c00
-    style Server fill:#e8f5e9,stroke:#388e3c
+    style ROOT fill:#fff3e0,stroke:#f57c00
 ```
 
-**Key insight**: Most engineers only think about step 7. **Steps 1-6 and 8-11 are where performance lives or dies.**
+### Real examples
+
+**HTTP/1.1** — self-describing + length:
+```
+GET /users HTTP/1.1\r\n     ← request line
+Host: example.com\r\n        ← headers, one per line
+Accept: */*\r\n
+\r\n                          ← BLANK LINE = end of headers
+{...}                         ← body, size given by Content-Length
+```
+The blank line marks the header/body boundary. `Content-Length` marks the message end.
+
+**Protocol Buffers** — length prefix:
+```
+[0x00 0x00 0x1F] "UserRequest{ id: 5, name: 'Bob' }"
+└──── 31 bytes ────┘
+└─ read this many, then parse ─┘
+```
+Fast: the server knows the size immediately, no scanning.
+
+**DNS** — fixed header + query ID:
+```
+[12-byte fixed header][question][answer]
+```
+Fixed size, plus a **query ID** so the client can match responses to questions (more on this in Unit 9).
+
+**Why length prefixes are faster:** with a length prefix, finding the message end is a single integer read — O(1). With a delimiter, you must scan byte-by-byte until you find it — O(n) and more CPU work.
+
+**Checkpoint:** Which framing does HTTP/1.1 use? Which does Protobuf? Why would a high-performance system prefer Protobuf's approach?
 
 ---
 
-## The Boundary Problem — The Hidden Fundamental
+## Unit 5 — Serialization: What's *Inside* the Message
 
-This was the biggest "aha" moment from the lecture.
+Framing tells you **where** the message is. Serialization tells you **what it means**.
 
-**In TCP, data is just a continuous byte stream.** There are no built-in message boundaries.
+```
+Your object            Serialization           Bytes on wire
+{ id: 5, name: "Bob" }  ──────────────►        {"id":5,"name":"Bob"}
+                        ◄──────────────
+                      Deserialization
+```
 
-The server must answer three questions for every incoming connection:
+- **Serialization** = object → bytes (before sending)
+- **Deserialization** = bytes → object (after receiving)
 
-| Question | Why It's Hard |
-|----------|---------------|
-| Where does this request **start**? | After previous request ends, or connection start |
-| Where does it **end**? | No universal answer — protocol-dependent |
-| Is this **one request or three**? | Must parse boundaries correctly |
+**The cost is real.** Converting bytes into a structure your language can use takes CPU and memory. For large payloads, it can be slow enough to matter — Hussein mentions JSON parsers taking *seconds* on large documents.
 
-**Every protocol solves this differently:**
-- **HTTP**: CRLF headers + `Content-Length` or chunked encoding
-- **Protocol Buffers**: Length prefix before each message
-- **DNS**: Fixed header with query ID in UDP datagram
-- **Custom binary**: Delimiter byte or length field
-
-> **The cost of parsing boundaries is NOT free.** A 10MB JSON body takes measurable CPU. That's why high-throughput systems use binary protocols with length prefixes — they parse in O(1) instead of scanning for delimiters.
-
----
-
-## Parsing ≠ Processing ≠ Serialization (Three Different Things)
-
-We clarified this distinction because the lecture (and many engineers) blur them:
-
-| Phase | Responsibility | Example |
-|-------|---------------|---------|
-| **Parse** | Find boundaries, understand structure | "This is HTTP GET /users/5" |
-| **Deserialize** | Convert wire bytes to usable objects | `{"id":5}` → `UserRequest{id:5}` |
-| **Process** | Execute the actual intent | `SELECT * FROM users WHERE id=5` |
-| **Serialize** | Convert result to wire format | `User{name:"Bob"}` → `{"name":"Bob"}` |
-| **Frame** | Add protocol headers | `HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n` |
-
-**Why this matters**: You can optimize each independently. Fast parser + slow deserializer = bad. Fast deserializer + slow processor = bad. They're different problems.
-
----
-
-## The Serialization Evolution — Why It Matters
-
-We traced the industry progression and the **engineering reasoning** behind each shift:
+### The industry progression (and *why*)
 
 ```mermaid
-flowchart TD
-    XML[SOAP/XML<br/>Enterprise standard]
-    JSON[REST/JSON<br/>Web standard]
-    PROTO[gRPC/Protocol Buffers<br/>High-performance]
-
-    XML -->|Problem: XML parsing EXPENSIVE<br/>DOM tree, namespaces, validation<br/>Verbose on wire| JSON
-    JSON -->|Problem: JSON parses char-by-char<br/>Human-readable = larger payloads<br/>No schema enforcement| PROTO
-
-    PROTO -.->|Binary, length-prefixed<br/>Schema-enforced<br/>10-100x faster parsing<br/>Not human-readable| Tooling[Requires tooling]
+flowchart LR
+    XML["XML / SOAP<br/>1990s enterprise"] -->|Verbose, expensive<br/>to parse| JSON["JSON / REST<br/>2010s web"]
+    JSON -->|Readable, no schema,<br/>char-by-char parse| PROTO["Protocol Buffers / gRPC<br/>Internal services"]
 
     style XML fill:#ffcdd2,stroke:#c62828
     style JSON fill:#fff9c4,stroke:#fbc02d
     style PROTO fill:#c8e6c9,stroke:#388e3c
-    style Tooling fill:#e1bee7,stroke:#8e24aa
 ```
 
-**Critical insight**: JavaScript has a **native advantage** with JSON because `JSON.parse()` is implemented in the engine (C++), not userland. In C++/Go/Java, you pay the full parsing cost.
+| Format | Readable | Parse speed | Size | Schema enforced |
+|---|---|---|---|---|
+| XML | Yes | Slow | Large | Sometimes |
+| JSON | Yes | Fast-ish (native in JS) | Medium | No |
+| Protobuf | No | Very fast | Small | Yes |
 
-> **Trade-off**: Human-readability (debugging ease) vs. parsing speed + payload size. There's no free lunch.
+**The trade-off:** readability (easy debugging) vs. speed and size (performance). You pick per boundary.
 
----
+**JavaScript's advantage:** `JSON.parse()` is built into the engine, so it's fast. In C++/Go/Java you pay full parsing cost for the same payload.
 
-## Request/Response Is the Universal Substrate
-
-We mapped the pattern across the **entire stack** — it's not just HTTP:
-
-| Layer | Protocol | It's Still Request/Response |
-|-------|----------|----------------------------|
-| **API** | REST, GraphQL, gRPC | ✅ |
-| **Database** | PostgreSQL wire protocol, MySQL protocol | ✅ |
-| **Infrastructure** | DNS (UDP-based!) | ✅ |
-| **Inter-service** | RPC, gRPC, Thrift | ✅ |
-| **Cache** | Redis RESP protocol | ✅ |
-| **Message queue** | Kafka produce/fetch, RabbitMQ AMQP | ✅ |
-
-**Everything you touch is Request/Response underneath.** Understanding this once pays dividends everywhere.
+**Checkpoint:** A teammate says "let's just use Protobuf everywhere for speed." What's the cost of taking that advice?
 
 ---
 
-## GraphQL — The Architectural Insight
+## Unit 6 — The Full Lifecycle
 
-We discussed why GraphQL exists and what it actually solves:
+Now we can see the whole picture. This is the refined version of the cycle — grouped by *who's doing the work*:
 
 ```mermaid
-sequenceDiagram
-    participant Client
-    participant REST_API as REST API
-    participant GraphQL_API as GraphQL API
-    participant Backend as Backend Services
-    participant DB as Database
-
-    Note over Client,REST_API: REST — Chatty (N+1 round-trips)
-    Client->>REST_API: GET /users/5
-    REST_API-->>Client: {id: 5, name: "Bob"}
-    Client->>REST_API: GET /users/5/posts
-    REST_API-->>Client: [{id: 1, ...}, {id: 2, ...}]
-    Client->>REST_API: GET /users/5/comments
-    REST_API-->>Client: [{id: 10, ...}]
-
-    Note over Client,GraphQL_API: GraphQL — Single round-trip
-    Client->>GraphQL_API: query { user(id:5) { name, posts, comments } }
-    GraphQL_API->>Backend: Resolve user
-    Backend->>DB: SELECT * FROM users WHERE id=5
-    GraphQL_API->>Backend: Resolve posts (batched)
-    Backend->>DB: SELECT * FROM posts WHERE user_id=5
-    GraphQL_API->>Backend: Resolve comments (batched)
-    Backend->>DB: SELECT * FROM comments WHERE user_id=5
-    GraphQL_API-->>Client: { user: { name, posts, comments } }
-```
-
-**But here's the key**: GraphQL doesn't eliminate the multiple queries — it **moves them from the network layer to the backend layer**. The backend can now:
-- Batch database queries
-- Use dataloaders to eliminate N+1
-- Create materialized views
-- Optimize with knowledge of the full query tree
-
-> **The network round-trip cost is replaced by backend coordination cost.** Sometimes that's a win, sometimes not.
-
----
-
-## The Timeline Visualization — Our Most Valuable Mental Model
-
-Hussein's timeline breaks down where time actually goes:
-
-```mermaid
-gantt
-    title Request/Response Timeline — Hidden Costs
-    dateFormat  X
-    axisFormat  %S
-
-    section Client
-    Serialize & Frame     :crit, t1, 0, 2
-    Write Request         :crit, t2, 2, 2
-    Receive Response      :crit, t5, 30, 2
-    Parse & Deserialize   :crit, t6, 32, 2
-
-    section Network
-    Request Transfer      :crit, net1, 2, 2
-    Response Transfer     :crit, net2, 30, 2
-
-    section Server
-    Parse Boundaries      :crit, s1, 2, 5
-    Deserialize           :crit, s2, 7, 3
-    Process (DB, Logic)   :crit, s3, 10, 20
-    Serialize Response    :crit, s4, 30, 2
-```
-
-**Each segment has distinct costs:**
-- **T-2→T0**: Client-side serialization + framing (often ignored)
-- **T0→T2**: Network RTT + TCP segmentation + IP routing + packet reordering
-- **T2→T30**: Boundary parsing + deserialization + **actual work** (DB, logic)
-- **T30→T32**: Response serialization + network RTT + client parsing
-
-**The trap**: Monitoring tools show you T2→T30 (your code). The rest is "invisible" but can dominate latency.
-
----
-
-## Chunked Upload — Extending the Pattern Creatively
-
-We analyzed the image upload example as a **pattern extension**, not a new pattern:
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server
-
-    Note over Client,Server: Naive: One giant request → fragile
-    Note over Client,Server: Chunked: Multiple requests with coordination
-
-    Client->>Server: POST /upload/init
-    Server-->>Client: {upload_id: "abc", chunk_size: 5MB}
-
-    par Parallel chunks (optional)
-        Client->>Server: POST /upload/abc/1 (chunk 1)
-        Server-->>Client: 200 OK
-        Client->>Server: POST /upload/abc/2 (chunk 2)
-        Server-->>Client: 200 OK
-        Client->>Server: POST /upload/abc/3 (chunk 3)
-        Server-->>Client: 200 OK
+flowchart TB
+    subgraph C["CLIENT"]
+        C1["1. Serialize<br/>object → bytes"]
+        C2["2. Frame + Write<br/>add protocol structure"]
     end
 
-    Client->>Server: POST /upload/abc/7 (final chunk)
-    Server-->>Client: 200 OK
-    Client->>Server: POST /upload/abc/done
-    Server-->>Client: {status: "assembled", file_id: "xyz"}
+    subgraph N["NETWORK"]
+        N1["3. Connect (TCP/TLS)<br/>if not already open"]
+        N2["4. Transmit<br/>TCP segments → IP packets → routed → reordered"]
+    end
 
-    Note over Server: Server tracks state:<br/>"Got chunks 1-3 of 7"
-    Note over Client,Server: If disconnect → resume from chunk 4
+    subgraph S["SERVER"]
+        S1["5. Reassemble<br/>reorder TCP segments"]
+        S2["6. Parse boundaries<br/>find where request starts/ends"]
+        S3["7. Deserialize<br/>bytes → object"]
+        S4["8. Process<br/>auth → validate → DB → business logic"]
+        S5["9. Serialize response"]
+    end
+
+    C1 --> C2 --> N1 --> N2 --> S1 --> S2 --> S3 --> S4 --> S5
+    S5 --> N2
+    N2 --> C1
+
+    style C fill:#e3f2fd,stroke:#1976d2
+    style N fill:#fff3e0,stroke:#f57c00
+    style S fill:#e8f5e9,stroke:#388e3c
 ```
 
-**Why this works**:
-- Each chunk is a normal Request/Response (fits existing infra)
-- Server tracks state → enables **resume** after disconnect
-- Client can parallelize chunk uploads
-- Backpressure handled naturally (slow client = slow chunks)
+**Read it as three questions:**
+1. **Who pays the cost?** Both sides. Client serializes, server deserializes, server serializes, client deserializes. Four conversions per exchange.
+2. **What's "your code"?** Only step 8. Steps 1–7 and 9 happen in libraries, the OS, and the network.
+3. **Where does time actually go?** Not just step 8 — see Unit 7.
 
-> **The pattern didn't change. The execution strategy did.**
+**Key distinction people blur:**
 
----
+| Term | What it does | Example |
+|---|---|---|
+| **Parse** | Find structure & boundaries | "This is an HTTP GET to /users/5" |
+| **Deserialize** | Convert payload to a usable object | `{"id":5}` → `UserRequest{id:5}` |
+| **Process** | Execute the intent | `SELECT * FROM users WHERE id=5` |
 
-## When Request/Response Is the Wrong Tool — Deep Dive
+Knowing the method (parse) is not the same as doing the work (process). The server does both.
 
-We identified the **failure modes** that drive the next lectures. Each failure mode reveals a fundamental mismatch between what Request/Response assumes and what the situation requires.
-
-### The Core Assumption of Request/Response
-
-> **Request/Response assumes the CLIENT drives the interaction.** The client knows what it wants, when to ask, and can wait for the answer.
-
-When this assumption breaks, the pattern fights you.
+**Checkpoint:** Your API's p99 latency is 800ms. The DB query is 50ms. Where are the other 750ms?
 
 ---
 
-### Failure Mode 1: Server Has Info, Client Doesn't Know to Ask (The Notification Problem)
+## Unit 7 — Where the Time Goes
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  USER A uploads video                                            │
-│       │                                                         │
-│       ▼                                                         │
-│  BACKEND: "Video uploaded!" ──needs to notify──► USER B          │
-│                                                                  │
-│  PROBLEM: User B's client doesn't know to ask                   │
-│           "Hey, any new videos?"                                │
-└─────────────────────────────────────────────────────────────────┘
-```
+Hussein's timeline, expressed as proportions rather than absolute units:
 
-**Request/Response workaround**: Polling
-```
-Client: "Any notifications?" → Server: "No"
-Client: "Any notifications?" → Server: "No"  
-Client: "Any notifications?" → Server: "Yes! Here's one"
+```mermaid
+flowchart LR
+    A["Client<br/>serialize"] --> B["Network<br/>out"]
+    B --> C["Server<br/>parse"]
+    C --> D["Server<br/>PROCESS"]
+    D --> E["Server<br/>serialize"]
+    E --> F["Network<br/>back"]
+    F --> G["Client<br/>parse"]
+
+    style D fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
 ```
 
-**Why it fails**: 
-- Wasted requests (99% empty responses)
-- Latency = polling interval
-- Doesn't scale (10K clients polling = 10K requests/sec)
+- The **green** box is the only part your APM dashboard shows as "application time."
+- Everything else is real, measurable, and frequently dominant.
 
-**Patterns that solve it**: **Push / SSE / WebSocket** (Lectures 8, 12)
+**Costs people forget:**
 
----
+| Hidden cost | Why it happens |
+|---|---|
+| TCP handshake | ~1 RTT before you can send anything (3-way) |
+| TLS handshake | Another 1–2 RTT |
+| Connection reuse | Amortized only if the connection is kept alive |
+| Packet reordering | Assembled by the OS, but costs latency |
+| Boundary parsing | CPU, scales with payload size |
+| Serialization | CPU on both ends |
+| Network RTT | Physical distance, ×2 per round trip |
 
-### Failure Mode 2: Long-Running Operations Exceed Client Timeout
+**Practical consequence:** shaving 40ms off a DB query is invisible if you've ignored a 300ms TLS handshake on every request. Measure the whole cycle, not your function.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Client: POST /process-video (5GB file)                         │
-│       │                                                         │
-│       ▼                                                         │
-│  Server: Processing... 30 seconds... 60 seconds... 120 seconds  │
-│       │                                                         │
-│       ▼                                                         │
-│  Client: ⏱️ TIMEOUT (default 30-60s)                            │
-│       │                                                         │
-│       ▼                                                         │
-│  Client: RETRIES → Duplicate work!                              │
-│  Server: Still processing original...                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Why it fails**:
-- Client can't wait indefinitely
-- Retries cause duplicate processing
-- No way for client to know "still working" vs "failed"
-
-**Patterns that solve it**: **Async + Callback / Webhook / Polling** (Lecture 9)
+**Checkpoint:** A team moves from HTTP/1.0 to keep-alive HTTP/1.1. What's the improvement, and what didn't improve?
 
 ---
 
-### Failure Mode 3: Chatty Clients (N+1 Requests)
+## Unit 8 — Request/Response Is Everywhere
 
-```
-REST: One resource = one endpoint = one request
+This pattern is not an HTTP feature. It's the substrate under nearly everything:
 
-Client needs: User + Posts + Comments + Followers
-              │
-              ├── GET /users/5
-              ├── GET /users/5/posts
-              ├── GET /users/5/comments  
-              └── GET /users/5/followers
-              
-= 4 round-trips, 4x latency, 4x connection overhead
-```
+```mermaid
+flowchart TB
+    subgraph L1["What you use"]
+        A["REST API"]
+        B["gRPC"]
+        C["SQL query"]
+        D["DNS lookup"]
+        E["Redis GET"]
+        F["Kafka produce/fetch"]
+    end
 
-**GraphQL helps** but still Request/Response — just moves chattiness to backend.
+    subgraph L2["What it actually is, underneath"]
+        RR["Request → parse → process → Response"]
+    end
 
-**Patterns that solve it**: **GraphQL / Batching** (this lecture)
+    A --> RR
+    B --> RR
+    C --> RR
+    D --> RR
+    E --> RR
+    F --> RR
 
----
-
-### Failure Mode 4: Large Data Transfer = Fragile
-
-```
-7GB upload → 90% complete → Network blip → CONNECTION RESET
-
-Result: 6.3GB wasted, start from zero
+    style RR fill:#fff9c4,stroke:#fbc02d,stroke-width:2px
 ```
 
-**Chunked upload extends the pattern** but adds complexity (state tracking, resume logic).
+Concrete examples:
 
-**Patterns that solve it**: **Chunked / Resumable** (pattern extension)
+| System | The "request" | The "response" |
+|---|---|---|
+| **HTTP** | `GET /users/5` | `{id:5, name:"Bob"}` |
+| **DNS** | "What's the IP for google.com?" | `142.250.190.46` |
+| **SQL** | `SELECT * FROM users WHERE id=5` | Rows |
+| **Redis** | `GET session:abc` | The session string |
+| **gRPC** | `GetUser(id=5)` | `User{...}` |
+| **Kafka** | Produce to topic | Offset ack |
+
+**Why this is worth internalizing:** once you see that DNS, SQL, and Redis are all the same shape, you stop treating them as unrelated tools. Their *performance characteristics* also become comparable — they all pay framing + serialization + network RTT.
+
+**Checkpoint:** A Redis `GET` is "just an in-memory lookup, basically free." Why is that reasoning wrong?
 
 ---
 
-### Failure Mode 5: High-Frequency Updates
+## Unit 9 — Two Revealing Variations
+
+### 9a. DNS: correlation, not order
+
+DNS uses **UDP** and can have hundreds of queries in flight. Responses can come back in any order. So how does the client know which answer belongs to which question?
+
+**Answer: a query ID.** The client generates an ID, puts it in the query, and matches it in the response.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Resolver
+    C->>R: Query #A111 "google.com?"
+    C->>R: Query #B222 "github.com?"
+    C->>R: Query #C333 "aws.com?"
+    R-->>C: Response #C333 (fastest)
+    R-->>C: Response #A111
+    R-->>C: Response #B222
+    Note over C: Match by ID, not arrival order
+```
+
+> **Never assume responses arrive in the order you sent requests.** This is a foundational backend principle, and it's why HTTP pipelining (send request B before A's response arrives) was abandoned — a slow A blocks B.
+
+### 9b. RPC: the abstraction that leaks
+
+RPC tries to make a remote call look like a local function call:
 
 ```
-Stock ticker: Price changes 100x/second
-Chat app: Messages every few seconds
-Live dashboard: Metrics updating constantly
-
-Polling: "Any updates?" 100x/sec = DDoS yourself
-Request/Response: Wrong direction (client pulls, server pushes)
+userService.getName(5)   ← looks local
 ```
 
-**Patterns that solve it**: **Pub/Sub / WebSocket** (Lecture 13)
+**The appeal:** the developer doesn't care that it's remote. Clean code.
+
+**The leak:** the moment it matters, the abstraction breaks down.
+
+| Question a local function can't raise | Question a remote call must raise |
+|---|---|
+| "Why is this slow?" | "How slow is the network, and did it timeout?" |
+| "Did it work?" | "Did it fail, or did the *response* get lost?" |
+| "What if I call it twice?" | "Is this call idempotent?" |
+| "It's an error — retry?" | "Did my first attempt already succeed?" |
+
+This is called a **leaky abstraction** — the illusion breaks under real-world conditions (latency, partial failure, network partitions).
+
+> **Lesson:** abstractions that hide "this is remote" always leak eventually. Design for the leak: timeouts, retries with idempotency keys, and explicit failure handling are not optional extras.
+
+**Checkpoint:** You call a remote method that times out. The client retries. What's the danger, and what's the standard fix?
 
 ---
 
-### Failure Mode 6: Massive Concurrent Connections
+## Unit 10 — GraphQL: Fixing the "Chatty Client" Problem
+
+**The problem:** REST is resource-oriented, and the client must know the shape of the data in advance. To build one screen, the client makes many round trips:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API
+    Note over C,API: REST — 3 round trips for 1 screen
+    C->>API: GET /users/5
+    API-->>C: {id:5, name:"Bob"}
+    C->>API: GET /users/5/posts
+    API-->>C: [{id:1, title:"..."}]
+    C->>API: GET /users/5/comments
+    API-->>C: [{id:10, text:"..."}]
+```
+
+**The cost:** each round trip is a full network latency. Three trips = 3× the wait, before any data is even useful. This is the **N+1 problem** at the HTTP layer.
+
+**GraphQL's answer:** let the client describe *exactly* what it wants in one request.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as GraphQL
+    participant DB as Database
+    Note over C,DB: GraphQL — 1 round trip
+    C->>G: query { user(id:5) { name posts { title } comments { text } } }
+    G->>DB: SELECT user
+    G->>DB: SELECT posts (batched)
+    G->>DB: SELECT comments (batched)
+    DB-->>G: results
+    G-->>C: { user: { name, posts, comments } }
+```
+
+**The crucial nuance (and the part people miss):** GraphQL did **not** eliminate the multiple queries. It **moved them from the network to the backend.**
 
 ```
-10,000 clients connected simultaneously
-Thread-per-request = 10,000 threads = OOM / context switch hell
+REST:    3 network round trips + 3 DB queries
+GraphQL: 1 network round trip + 3 DB queries (but batched, sometimes merged into fewer)
 ```
 
-**Patterns that solve it**: **Multiplexing / async I/O / event loop** (Lecture 14)
+The win is real — but only because the backend now has **full knowledge of the query**, so it can batch, merge, or use a dataloader. You traded network latency for backend coordination. Sometimes that's a win; sometimes it isn't.
+
+**Checkpoint:** A GraphQL endpoint still takes 400ms. You removed 2 network round trips. Why might it still be slow?
 
 ---
 
-## The Pattern-First Mapping
+## Unit 11 — Chunked Upload: Same Pattern, Different Strategy
 
-| Failure Mode | Why Request/Response Fails | Pattern That Solves It |
-|--------------|---------------------------|------------------------|
-| **Server has event, client doesn't know to ask** | Client must poll ("Anything? No. Anything? No.") | **Push / SSE / WebSocket** (Lectures 8, 12) |
-| **Operation exceeds client timeout** | Client hangs, retries, duplicates work | **Async + callback/polling** (Lecture 9) |
-| **Client needs many related resources** | N+1 requests, head-of-line blocking | **GraphQL / Batching** (this lecture) |
-| **Large/unreliable transfer** | Failure = total loss, no resume | **Chunked / Resumable** (pattern extension) |
-| **High-frequency updates** | Polling wastes resources, wrong direction | **Pub/Sub / WebSocket** (Lecture 13) |
-| **Massive concurrent connections** | Thread-per-request doesn't scale | **Multiplexing / async I/O** (Lecture 14) |
+For huge uploads (7GB video), naive Request/Response breaks:
 
----
+```
+POST /upload  (7GB)  →  90% done  →  network blip  →  connection reset
+                                              ↑
+                                    6.3 GB wasted, start over
+```
 
-**This is the pattern-first thinking**: Don't ask "which technology?" Ask **"which failure mode am I hitting?"**
+**Why it fails:** one request = one atomic success or total failure. No resume.
 
----
+**The fix — still Request/Response, just split:**
 
-## When Request/Response Is the Wrong Tool (Summary)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: POST /upload/init → start session
+    S-->>C: {upload_id: "abc", chunk_size: 5MB}
+    C->>S: POST /abc/chunk/1
+    S-->>C: 200 OK
+    C->>S: POST /abc/chunk/2
+    S-->>C: 200 OK
+    Note over C,S: ⚡ Client disconnects after chunk 3
+    C->>S: GET /abc/status (after reconnect)
+    S-->>C: {received: [1,2,3], total: 7}
+    C->>S: POST /abc/chunk/4 ... resumes!
+    C->>S: POST /abc/complete
+    S-->>C: {file_id: "xyz"}
+```
 
-| Failure Mode | Why Request/Response Fails | Next Pattern |
-|--------------|---------------------------|--------------|
-| **Server has event, client doesn't know to ask** | Client must poll ("Anything? No. Anything? No.") | **Push / SSE / WebSocket** (Lectures 8, 12) |
-| **Operation exceeds client timeout** | Client hangs, retries, duplicates work | **Async + callback/polling** (Lecture 9) |
-| **Client needs many related resources** | N+1 requests, head-of-line blocking | **GraphQL / Batching** (this lecture) |
-| **High-frequency updates** | Polling wastes resources, push needed | **Pub/Sub** (Lecture 13) |
-| **Massive concurrent connections** | Thread-per-request doesn't scale | **Multiplexing / async I/O** (Lecture 14) |
+**What this teaches us:** the *pattern* didn't change — still request, still response. What changed is the **execution strategy**: we're now keeping state on the server, which makes the operation **resumable**.
 
-**This is the pattern-first thinking**: Don't ask "which technology?" Ask "which failure mode am I hitting?"
+This is the same insight behind idempotency keys, resumable downloads, and multipart uploads. It also foreshadows Lecture 9 (sync vs async): when work is long-running, the request shouldn't have to stay open.
 
----
-
-## The Curl Demo — What We Learned from the Wire
-
-Command: `curl -v --trace-ascii output.txt http://google.com`
-
-**What the trace reveals**:
-1. **TCP handshake first** — connection cost before any request
-2. **DNS resolution** — separate UDP request/response before HTTP
-3. **Request headers** — text format, CRLF-delimited, ends with blank line
-4. **Response headers first** — status line + headers, then body
-5. **Headers arrive incrementally** — not atomically (streaming parse)
-6. **301 redirect** — Location header tells client where to go next
-
-**Two critical backend principles demonstrated**:
-- **"Don't trust order"** — DNS uses query IDs because 100 concurrent requests = out-of-order responses. HTTP pipelining died because of head-of-line blocking.
-- **Protocols are designed for streaming parse** — you process headers as they arrive, not after full receipt.
+**Checkpoint:** Why can't the server just guess which chunks are missing, without the client asking?
 
 ---
 
-## The Deeper Principle We Extracted
+## Unit 12 — Seeing It on the Wire
 
-> **Request/Response is the *default* because it's simple to reason about. But simplicity at the API level hides massive complexity at the transport, parsing, and serialization levels.**
+Hussein's `curl` demo makes the abstract concrete:
 
-A backend engineer who internalizes the **full cycle** makes fundamentally better decisions:
+```bash
+curl -v --trace-ascii trace.txt http://google.com
+```
 
-| Decision | Junior thinks | Senior (with this model) thinks |
-|----------|---------------|----------------------------------|
-| **Protocol** | "REST is standard" | "gRPC saves parsing + enables streaming for this workload" |
-| **API design** | "One endpoint per resource" | "GraphQL reduces client round-trips; dataloaders fix N+1" |
-| **Large data** | "Increase upload limit" | "Chunked upload with resume = resilience + backpressure" |
-| **Timeouts** | "Set timeout to 60s" | "This operation is async; return job ID + webhook/callback" |
-| **Performance** | "Optimize the DB query" | "Serialization + network RTT dominate; fix those first" |
+What actually happened, in order:
 
----
+```mermaid
+sequenceDiagram
+    participant C as curl
+    participant D as DNS
+    participant S as google.com
+    C->>D: DNS query for google.com (UDP)
+    D-->>C: 142.250.190.46 (matched by query ID)
+    C->>S: TCP handshake (SYN, SYN-ACK, ACK)
+    C->>S: TLS handshake (if https)
+    C->>S: GET / HTTP/1.1 + headers + blank line
+    S-->>C: 301 Moved Permanently + Location header
+    S-->>C: HTML body
+```
 
-## Vocabulary We Anchored
+**Things to notice:**
 
-| Term | Our Definition |
-|------|---------------|
-| **Boundary detection** | Finding start/end of a message in a byte stream |
-| **Framing** | Adding protocol structure (headers, length, delimiters) around payload |
-| **Serialization** | Domain object → wire bytes |
-| **Deserialization** | Wire bytes → domain object |
-| **Head-of-line blocking** | Request B waits behind slow Request A on same connection |
-| **Query ID** | Correlation token matching responses to requests (DNS, RPC) |
-| **Chunked encoding** | Streaming body in length-prefixed chunks (no Content-Length needed) |
-| **Leaky abstraction** | RPC hides "this is remote" until latency/failure exposes it |
+1. **DNS happened first** — a separate Request/Response, over UDP, before HTTP even started.
+2. **The handshake is cost** — you pay it *before* your request unless the connection is reused.
+3. **Headers arrive incrementally** — the client parses as bytes arrive, not after full receipt. This is why streaming parsers exist.
+4. **301 + `Location`** — the server's response says "go ask over there." The response *instructs* a future request. Classic example of Request/Response in action.
 
----
+**Why this matters:** the trace shows that a single `GET` involves *multiple* protocols, each with its own Request/Response. "How does a browser load a page?" is not one exchange — it's DNS + TCP + TLS + HTTP, four layers, each with framing and its own costs.
 
-## Questions We're Carrying Forward
-
-- How do modern HTTP/2 and HTTP/3 change the timeline (multiplexing, QUIC)?
-- What's the real-world JSON vs Protobuf parsing difference in our stack?
-- When exactly does gRPC's HTTP/2 multiplexing beat REST/HTTP/1.1?
-- How do load balancers and proxies affect the boundary parsing?
+**Checkpoint:** Your API is slow and you see high DNS resolution time. Which part of the request/response cycle is hurting you, and what would you change?
 
 ---
 
-## Notes for Next Lecture (Push)
+## Unit 13 — Where the Pattern Breaks Down
 
-The lecture ended by setting up **Push** as the answer to the notification problem:
-- "Server has info, client doesn't know to ask"
-- Polling is the naive Request/Response workaround
-- Push, SSE, WebSocket, Pub/Sub are the real solutions
-- We'll see how they differ in delivery guarantees, connection management, scalability
+Request/Response rests on two assumptions (Unit 1). Here is exactly what breaks when those assumptions fail:
 
-**Our lens for the next lecture**: "What problem does Push solve that Request/Response cannot, and what new problems does Push introduce?"
+| # | Assumption that breaks | Scenario | What goes wrong | Next pattern |
+|---|---|---|---|---|
+| 1 | Client-initiated | Notification: someone commented on your post | Client doesn't know to ask → must poll | **Push / SSE / WebSocket** |
+| 2 | Request stays open | Report generation takes 5 minutes | Client times out, retries, duplicates work | **Async + job queue** |
+| 3 | One resource per request | Screen needs user + posts + comments | N+1 round trips | **GraphQL / batching** |
+| 4 | One shot is atomic | 7GB upload | Failure = total loss | **Chunked / resumable** |
+| 5 | Low frequency | Live stock prices, chat | Polling = self-inflicted DDoS | **WebSocket / Pub/Sub** |
+| 6 | Connections are cheap | 100K concurrent clients | Thread-per-connection = collapse | **Multiplexing / async I/O** |
+
+### The master insight
+
+```mermaid
+flowchart TB
+    A["Request/Response assumes:<br/>① client drives<br/>② the request completes quickly"] --> B["When ① fails<br/>→ the server needs to speak first<br/>→ PUSH / SSE / WEBSOCKET"]
+    A --> C["When ② fails<br/>→ the work outlives the request<br/>→ ASYNC / JOB QUEUE / WEBHOOK"]
+```
+
+> **Every pattern in the rest of this section is a deliberate violation of one of these two assumptions — and a careful engineering of what you lose by violating it.**
+
+That is the through-line. Push breaks #1. Async breaks #2. Pub/Sub, multiplexing, and sidecar are variations on the same theme.
+
+**Checkpoint:** For each of the 6 rows above — is it breaking assumption ①, assumption ②, or neither?
 
 ---
 
-*Documented from our shared analysis and discussion. This captures our mental models, not just the transcript.*
+## Summary — The Mental Model to Keep
+
+```mermaid
+flowchart TB
+    subgraph F["Foundations"]
+        F1["A request is BYTES, not an object"]
+        F2["TCP is a stream → boundaries must be created by the protocol"]
+        F3["Framing solves boundaries; serialization solves meaning"]
+    end
+
+    subgraph C["The Cost"]
+        C1["4 serialization/deserialization steps per exchange"]
+        C2["Handshakes, RTT, parsing — usually invisible, often dominant"]
+    end
+
+    subgraph E["The Scope"]
+        E1["It's everywhere: HTTP, DNS, SQL, Redis, Kafka, gRPC"]
+    end
+
+    subgraph B["The Boundary"]
+        B1["Client drives + request completes quickly"]
+        B2["Break ① → Push / SSE / WebSocket"]
+        B3["Break ② → Async / job queue / webhook"]
+    end
+
+    F --> C --> E --> B
+
+    style F fill:#e3f2fd,stroke:#1976d2
+    style C fill:#fff3e0,stroke:#f57c00
+    style E fill:#e8f5e9,stroke:#388e3c
+    style B fill:#ffcdd2,stroke:#c62828
+```
+
+**If you remember only three things:**
+
+1. **A request is bytes.** Framing finds its edges; serialization gives it meaning. Both cost CPU.
+2. **Request/Response is a universal substrate** — once you see it in DNS and SQL, you see it everywhere.
+3. **The pattern assumes the client drives and the request is short.** Every other pattern in this section is a deliberate break of one of those assumptions.
+
+---
+
+## Vocabulary
+
+| Term | Meaning |
+|---|---|
+| **Byte stream** | TCP delivers a continuous flow of bytes with no inherent message structure |
+| **Framing** | The technique a protocol uses to mark message boundaries |
+| **Length prefix** | A framing technique: store the message size, read exactly that many bytes |
+| **Delimiter** | A framing technique: read until a special marker byte/sequence |
+| **Boundary detection** | The server's work of finding where a message starts and ends |
+| **Serialization** | Converting an object into bytes for transmission |
+| **Deserialization** | Converting received bytes back into a usable object |
+| **Payload** | The actual data being carried, excluding protocol framing |
+| **Round trip (RTT)** | Time for a request to reach the server and the response to return |
+| **Handshake** | Setup exchange before real data flows (TCP SYN, TLS) |
+| **Idempotency** | An operation that produces the same result if repeated |
+| **Leaky abstraction** | An abstraction that hides important details until they cause failures |
+| **Head-of-line blocking** | A slow message delays everything queued behind it on the same stream |
+| **N+1 problem** | One request returning data that requires many follow-up requests |
+
+---
+
+## Self-Test — Can You Answer These?
+
+If any answer is unclear, revisit that unit.
+
+1. Why can't the server rely on TCP to tell it where one request ends and the next begins? *(Unit 3)*
+2. What's the difference between framing and serialization? *(Units 2 & 5)*
+3. A `Content-Length: 0` header vs. a blank line — what does each tell the server? *(Unit 4)*
+4. Your endpoint's DB query is 10ms but p99 latency is 900ms. What are the likely suspects? *(Unit 7)*
+5. Why must DNS responses be matched by query ID rather than arrival order? *(Unit 9a)*
+6. What makes RPC a leaky abstraction, and what mitigations exist? *(Unit 9b)*
+7. In what sense did GraphQL *not* actually solve the N+1 problem? *(Unit 10)*
+8. Chunked upload is still Request/Response — what actually changed? *(Unit 11)*
+9. Loading a webpage involves how many distinct Request/Response exchanges? *(Unit 12)*
+10. A chat app's messages arrive late and out of order. Which assumption was broken, and what's the fix? *(Unit 13)*
+
+---
+
+## Carried Into Lecture 8 (Push)
+
+| Question we'll answer next |
+|---|
+| How does the server start a conversation when Request/Response is client-initiated? |
+| What's the cost of keeping connections open, and who pays it? |
+| How do you deliver a message to a client that might be asleep, offline, or behind a flaky network? |
+| Push, SSE, and WebSockets all "push" — what makes them different problems? |
+
+---
+
+*Built up unit by unit. Each unit depends on the one before it.*

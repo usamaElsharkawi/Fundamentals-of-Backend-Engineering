@@ -2,10 +2,6 @@
 
 ## Status: Completed ✅
 
-## Transcript Summary
-
-Hussein Nasser introduces Section 2, explaining that these patterns emerged from 17-18 years of experience building backend applications, drawing from companies like Netflix, Google, and Twitter. He emphasizes these are **first principles** — foundational patterns, not the only ones. New patterns may emerge in the future. The section covers: Request/Response, Sync/Async, Push, Polling, Long Polling, SSE, Pub/Sub, Multiplexing/Demultiplexing, Stateful/Stateless, Sidecar.
-
 ## Key Concepts
 
 ### Core Insight: Backend = Communication
