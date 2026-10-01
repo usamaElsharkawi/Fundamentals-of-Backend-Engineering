@@ -380,7 +380,249 @@ flowchart TB
 
 ---
 
-## Unit 12 — The Bug That Wasn't Just Bad Code
+## Unit 12 — WebSocket Connection Lifecycle (Deep Dive)
+
+Unit 11 showed *that* WebSocket upgrades from HTTP. This unit walks the **complete lifecycle**, layer by layer, because the whole thing confuses people: **three separate events happen in sequence, each owned by a different layer, and each can fail independently.**
+
+### 12.1 — The Three Independent Events
+
+```mermaid
+flowchart TB
+    A["new WebSocket(...)"] --> B["TCP connection<br/>established"]
+    B --> C["WebSocket handshake<br/>completed"]
+    C --> D["open event fires"]
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#fff3e0,stroke:#f57c00
+    style C fill:#e8f5e9,stroke:#388e3c
+    style D fill:#ffcdd2,stroke:#c62828
+```
+
+People usually picture these as one continuous flow. They are not. Draw them as three checkpoints.
+
+---
+
+### 12.2 — Phase 1: `new WebSocket(...)` Does *Nothing*
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080');
+```
+
+This line **does not open a connection**. It is synchronous, returns immediately, and gives you an object. **No network activity has happened yet.**
+
+The browser has registered an *intent* to connect. The real work happens asynchronously in the background.
+
+**Why this matters:** there is no return value that tells you "connected." You cannot write:
+
+```javascript
+if (isConnected(ws)) { ... }   // ❌ does not exist
+```
+
+That is exactly why the `open` event exists — it is the only way to learn the connection is ready:
+
+```javascript
+ws.onopen = () => { ws.send('hi'); };   // ✅ send only after open
+```
+
+> **Calling `ws.send()` before `open` throws `InvalidStateError`.** The connection isn't there yet. This is the single most common beginner bug.
+
+---
+
+### 12.3 — Phase 2: Delegation Down the Stack
+
+JavaScript **cannot touch the network** — the browser sandboxes it as a security boundary. So the delegation goes:
+
+```mermaid
+flowchart LR
+    B["Browser<br/>renderer process"] --> N["Browser<br/>network process"]
+    N --> OS["OS kernel<br/>sockets"]
+    OS --> T["TCP/IP stack"]
+
+    style B fill:#e3f2fd,stroke:#1976d2
+    style N fill:#e1bee7,stroke:#8e24aa
+    style OS fill:#fff3e0,stroke:#f57c00
+    style T fill:#e8f5e9,stroke:#388e3c
+```
+
+**A detail worth knowing:** in Chrome your JS runs in a *renderer process* with **no network access at all**. All networking happens in a separate *network process*. This is security isolation — a compromised renderer can't perform raw network I/O.
+
+**DNS resolution:** `localhost` → `127.0.0.1`
+
+Note this never leaves your machine — no DNS query reaches a nameserver. The resolver answers from `/etc/hosts` or built-in rules.
+
+Conceptually it is still a **resolution step**, identical to `google.com` → `142.250.190.46`. Same purpose: **convert a name into the numbers TCP needs** (IP address + port).
+
+---
+
+### 12.4 — Phase 3: The TCP 3-Way Handshake
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: SYN<br/>"I want to connect, my initial seq = x"
+    S-->>C: SYN-ACK<br/>"Accepted, my initial seq = y"
+    C->>S: ACK<br/>"I have your seq = y"
+    Note over C,S: Both sides now agree on sequence numbers
+```
+
+**Why three steps and not two?** Each solves a distinct problem:
+
+| Step | Question it answers |
+|---|---|
+| **SYN** | "Is anyone there, and do they agree to talk?" |
+| **SYN-ACK** | "Am *it* reachable?" — proves the **client** is real too |
+| **ACK** | "Both sides know both sequence numbers" |
+
+The real payload is the exchange of **initial sequence numbers (ISNs)**. Once both sides know where each other's byte numbering begins, every subsequent byte can be acknowledged and reordered correctly.
+
+**Side effect that matters later:** the client's OS picks an **ephemeral source port** during this handshake. That is where `remotePort` in the demo code comes from — the 4-tuple is fixed for the life of the connection.
+
+---
+
+### 12.5 — Phase 4: The Upgrade Request (The Actual Magic)
+
+After TCP is up, the client sends a **completely normal HTTP request** — plain text, same as any other:
+
+```http
+GET /chat HTTP/1.1
+Host: localhost:8080
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+```
+
+**Why start with HTTP instead of inventing a new handshake?** Because it makes WebSocket **free to deploy**. Every piece of existing HTTP infrastructure already understands it:
+
+| Infrastructure | What it can already do |
+|---|---|
+| **Reverse proxy (nginx)** | Routes it like any HTTP request — if configured to pass `Upgrade` |
+| **Load balancer** | Balances it like any connection |
+| **Authentication** | Send `Cookie` / `Authorization` in the handshake |
+| **Firewall / WAF** | Inspects it as HTTP |
+| **Server** | Reject with normal codes: `401`, `403`, `404` |
+
+**No new protocol, no new port, no new infrastructure.** WebSocket rides on HTTP.
+
+### The Key/Accept Trick
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Proxy / Cache
+    participant S as Server
+
+    C->>P: GET /chat (Upgrade: websocket)<br/>Sec-WebSocket-Key: abc123
+    P->>S: forward
+    S-->>P: 101 Switching Protocols<br/>Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+    P-->>C: 101
+
+    Note over C,S: Accept = base64(SHA1(key + GUID))
+```
+
+Two purposes:
+
+1. **Proves the server actually speaks WebSocket** — a plain HTTP server cannot fake it
+2. **Defeats caching proxies** — a cache cannot replay a stored `101`, because the answer depends on the client's random key
+
+---
+
+### 12.6 — Phase 5: `101 Switching Protocols`
+
+```http
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+**The moment this returns, HTTP semantics stop:**
+
+| Before the 101 | After the 101 |
+|---|---|
+| HTTP requests and responses | Raw WebSocket frames |
+| Status codes (200, 404, 500) | No status codes — just data frames |
+| Headers per message | Custom binary frame headers |
+| One side leads | Both sides may send at any time |
+
+Nothing about the **transport** changed. Same socket, same TCP, same 4-tuple. **Only the protocol layered on top was swapped.**
+
+> **WebSocket is just HTTP performing a protocol swap in place — everything after the `101` is a different language on the same wire.**
+
+---
+
+### 12.7 — The Critical Distinction: TCP ≠ WebSocket
+
+"TCP connected" and "WebSocket open" are **different events with different failure modes**:
+
+```mermaid
+flowchart TB
+    T["TCP established"] --> H{"Server returns<br/>101?"}
+    H -->|Yes| O["✅ open event"]
+    H -->|"404, 401, 500"| E["❌ error / close event"]
+    H -->|"no response"| TO["⏱️ timeout → error"]
+
+    style O fill:#c8e6c9,stroke:#388e3c
+    style E fill:#ffcdd2,stroke:#c62828
+    style TO fill:#ffcdd2,stroke:#c62828
+```
+
+**The TCP connection can succeed while WebSocket fails.**
+
+Example: the server is reachable (TCP fine), but you hit the wrong path → it replies `404`. From the network's view everything worked. But no WebSocket exists, and the browser fires `error` — **not** `open`.
+
+> **Never treat "TCP is up" as "WebSocket is ready."**
+
+---
+
+### 12.8 — What the Simplified Diagram Leaves Out
+
+| Missing | Why it matters |
+|---|---|
+| **TLS handshake** | For `wss://`, TLS sits *between* TCP established and the HTTP upgrade — so the upgrade runs over an encrypted channel |
+| **Key/Accept exchange** | Proves WebSocket support; defeats proxy caching |
+| **Failure paths** | `401`/`404`/`500` at the upgrade → no WebSocket, ever |
+| **The event loop** | All of this is async; `onopen` fires on a later tick, never inline |
+| **Multi-process browser** | Networking is not in the same process as your JS |
+
+---
+
+### 12.9 — Why Backend Engineers Must Care
+
+This is not academic — it decides whether your deployment works:
+
+| Concern | Consequence |
+|---|---|
+| **nginx must forward `Upgrade`** | Otherwise the handshake silently fails; you get a `200` and no upgrade |
+| **Load balancer timeouts** | Default is often 30–60s. A WebSocket lives for **hours**. It will be killed mid-session |
+| **Long-lived connections** | Consumes a file descriptor + buffers per client (recall Unit 4's idle cost) |
+| **No HTTP semantics after 101** | You cannot get a `429` rate-limit response mid-session. **You must implement flow control in your app** |
+| **Sticky sessions** | The 4-tuple identity binds the client to one instance — no load balancing freedom |
+
+### The nginx trap
+
+```nginx
+# BROKEN — nginx buffers and drops the upgrade
+location /ws {
+    proxy_pass http://backend;
+}
+
+# WORKS — must explicitly forward the upgrade
+location /ws {
+    proxy_pass http://backend;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
+**Checkpoint:** A WebSocket connects successfully (you see `open` in the console), then disconnects after exactly 60 seconds with no error. What is almost certainly happening, and which table row above predicts it?
+
+---
+
+## Unit 13 — The Bug That Wasn't Just Bad Code
 
 Hussein deliberately closed a client and kept sending. Two real problems surfaced.
 
@@ -453,7 +695,7 @@ flowchart TB
 
 ---
 
-## Unit 13 — When to Use Push
+## Unit 14 — When to Use Push
 
 | Situation | Verdict | Why |
 |---|---|---|
@@ -510,6 +752,10 @@ flowchart TB
 2. **Expensive when idle, cheap when active** — you pay connections continuously to make delivery instant.
 3. **You own delivery correctness** — no acknowledgement, no backpressure, no persistence. Push is best-effort that requires a listener.
 
+### And one thing to watch in every push deployment
+
+**The connection is a long-lived, protocol-upgraded, resource-hungry thing that no HTTP status code can save you from once it's open.** After the `101`, you have no `429`, no `503`, no retry-after. Rate limiting, backpressure, and reconnect policy all become *your* application code (Unit 12.9).
+
 ---
 
 ## Vocabulary
@@ -524,6 +770,13 @@ flowchart TB
 | **Idempotent consumer** | A consumer that can safely read the same message multiple times |
 | **Consumer offset** | Kafka's per-consumer position in the log |
 | **101 Switching Protocols** | HTTP response that upgrades a connection to WebSocket |
+| **Protocol upgrade** | Swapping the application protocol on an existing connection without changing the transport |
+| **Sec-WebSocket-Key / Accept** | Random key + hashed reply proving the server speaks WebSocket and defeating proxy caching |
+| **3-way handshake** | SYN → SYN-ACK → ACK; confirms reachability and exchanges initial sequence numbers |
+| **ISN (Initial Sequence Number)** | The starting byte counter a side announces during the handshake |
+| **Ephemeral port** | The client-side port the OS picks at connect time; part of the 4-tuple |
+| **`readyState`** | WebSocket connection state (`CONNECTING` / `OPEN` / `CLOSING` / `CLOSED`) — check before writing |
+| **`InvalidStateError`** | Thrown when calling `send()` before the connection is `OPEN` |
 | **4-tuple** | (source IP, source port, destination IP, destination port) — uniquely identifies a TCP connection |
 | **Socket buffer** | Kernel-space queue between sender and receiver; fills when receiver is slow |
 | **Log-based messaging** | Kafka's model — append-only durable log, consumers pull at their own offset |
@@ -544,7 +797,10 @@ If any answer is unclear, revisit that unit.
 6. Explain the RabbitMQ vs Kafka difference purely in terms of *where backpressure lives*. *(Unit 9)*
 7. gRPC server streaming is "push" — so where did the request go? *(Unit 10)*
 8. What changes about the transport when WebSocket upgrades? What stays the same? *(Unit 11)*
-9. Why is the closed-client crash a *fundamental* push problem, not just a coding mistake? *(Unit 12)*
+9. Why is the closed-client crash a *fundamental* push problem, not just a coding mistake? *(Unit 13)*
+10. A WebSocket connects fine, then dies at exactly 60 seconds. Why? *(Unit 12.9)*
+11. Why does WebSocket start with HTTP instead of defining its own handshake? *(Unit 12.5)*
+12. Your TCP connection is fine but you got `error`, not `open`. What happened? *(Unit 12.7)*
 10. You're building a live scoreboard. At what point does push become the wrong answer? *(Unit 13)*
 
 ---
