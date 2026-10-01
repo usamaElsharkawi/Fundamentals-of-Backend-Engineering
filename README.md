@@ -50,3 +50,12 @@ Understand the **why**, not just the **what**. Build strong mental models. Conne
 - **Deployment**: Sidecar
 
 > **"What problem am I solving, and what trade-offs am I willing to accept?"**
+
+## Reference Docs
+
+Supplementary material documented alongside the lectures:
+
+| Doc | Covers | Referenced from |
+|---|---|---|
+| [Message Brokers — RabbitMQ vs Kafka](Section%202%3A%20Backend%20Communication%20Design%20Patterns/message-brokers-rabbitmq-vs-kafka.md) | What a broker is, message brokers as decoupling, RabbitMQ queue model vs Kafka log model, delivery guarantees, consumer groups | Lecture 8 Unit 9, Lecture 13 (Pub/Sub) |
+| [HTTP Versions Comparison](Section%202%3A%20Backend%20Communication%20Design%20Patterns/http-versions-comparison.md) | HTTP/1.1 vs HTTP/2 vs HTTP/3, framing, HPACK/QPACK, QUIC, HOL blocking | Lecture 7 (Request/Response) |

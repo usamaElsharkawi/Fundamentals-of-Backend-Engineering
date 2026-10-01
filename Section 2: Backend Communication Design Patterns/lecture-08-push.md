@@ -245,6 +245,8 @@ This is the pub/sub idea arriving early. We formalize it in Lecture 13.
 
 ## Unit 9 — RabbitMQ vs Kafka: The Design Lesson
 
+> 📚 **Prerequisite:** This unit assumes you know what a message broker is. If RabbitMQ and Kafka are unfamiliar, read **[Message Brokers — RabbitMQ vs Kafka](message-brokers-rabbitmq-vs-kafka.md)** first. It builds up from "what is a broker" to "why these two differ."
+
 Same problem — deliver a message to consumers. **Opposite architectural choices.**
 
 ```mermaid
