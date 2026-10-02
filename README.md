@@ -12,7 +12,7 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 ### Section 2: Backend Communication Design Patterns
 - **Progress:** 3 / 11 lectures | 3hr 26min total
 - **Completed:** Lecture 6 — Intro ✅, Lecture 7 — Request Response ✅, Lecture 8 — Push ✅
-- **Current:** Lecture 9 — Synchronous vs Asynchronous Workloads
+- **Current:** Lecture 9 — Synchronous vs Asynchronous Workloads (Unit 1 of 10 documented)
 - **Remaining:** 8 lectures
 - **Lectures:**
   1. ✅ [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
