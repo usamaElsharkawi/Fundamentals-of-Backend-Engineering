@@ -1,6 +1,6 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–2 documented)
+## Status: In Progress 🔄 (Units 1–3 documented)
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -511,6 +511,327 @@ That is the bridge to Unit 3: the modern answer is not "remember to sprinkle som
 
 ---
 
+## Unit 3 — How Async Learns About Completion
+
+Unit 2 ended with the waste: your program frozen, the kernel frozen, the device working. Async fixes that by **not waiting**. But that immediately creates a new problem — and this unit is about solving it.
+
+### 3.1 — The Problem Async Creates
+
+```mermaid
+flowchart LR
+    A["I send the request"] --> B["I move on<br/>do other work"]
+    B --> C{"But how do I<br/>know it finished?"}
+    C --> D["I have no idea.<br/>The result may sit<br/>there unnoticed<br/>forever."]
+
+    style C fill:#fff9c4,stroke:#fbc02d
+    style D fill:#ffcdd2,stroke:#c62828
+```
+
+Synchronous code didn't have this problem — you were standing right there when the answer arrived.
+
+Async code walks away. So something must **tell it** when to come back. And there are exactly **two philosophies** for how that notification works.
+
+Both are non-blocking. Both are async. They differ in **who does the work**.
+
+---
+
+### 3.2 — Design A: Readiness ("Is it ready?")
+
+**The idea:** you ask the OS *"is this thing ready yet?"* over and over. When it says yes, **you** perform the operation.
+
+```mermaid
+flowchart TB
+    A["1. Ask the OS:<br/>is fd 3 ready?"] --> B{"Ready?"}
+    B -->|"No"| A
+    B -->|"YES"| C["2. YOU call read(fd 3)<br/>and get the data"]
+    C --> D["3. Process it"]
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#fff9c4,stroke:#fbc02d
+    style C fill:#c8e6c9,stroke:#388e3c
+```
+
+**The OS's role is small:** it is a *notifier*. It says "go ahead," then gets out of the way.
+
+### The progression
+
+| API | Era | Limit |
+|---|---|---|
+| `poll` | Ancient | You pass the **whole list** of fds on every call |
+| `select` | Ancient | Hard cap (1024 fds) and **mutates your fd_set** |
+| `epoll` | Linux, modern | You **register once**, then ask "anything ready among all of them?" |
+
+`epoll` is the important one. You hand the kernel your fd list **once** at setup:
+
+```c
+epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event);   // once, at startup
+
+while (running) {
+    n = epoll_wait(epfd, events, MAX, -1);    // blocks until ANY is ready
+    for (i = 0; i < n; i++) {
+        if (events[i].data.fd == listen_fd)   accept_new_client();
+        else                                  handle_read(events[i].data.fd);
+    }
+}
+```
+
+**One `epoll_wait` serves thousands of connections.** That is the whole scalability trick — and it only works because you registered once. (See the fd clarification below for what `fd` actually is.)
+
+### The crucial subtlety: "ready" ≠ "data is there"
+
+Readiness strictly means:
+
+> **"An operation on this fd will not block."**
+
+Not "you'll get everything you asked for." Three consequences that bite in production:
+
+**a) One readiness event may not satisfy your read**
+```c
+epoll_wait(...) → fd 3 is readable
+read(fd3, buf, 1024);   // returns only 40 bytes!
+```
+A socket delivers whatever has arrived. 40 bytes ≠ 1024 requested. You must loop until you have enough — or until the connection would block again.
+
+**b) Readiness is about *conditions*, not data**
+One fd can be readable *and* writable. A socket is nearly always writable (send buffer has space). Programs often care about only one direction.
+
+**c) Level-triggered vs edge-triggered** — a real production footgun:
+
+| Mode | Fires | Danger |
+|---|---|---|
+| **Level-triggered** (default) | Every call, *while* ready | Safe, slightly more syscalls |
+| **Edge-triggered** | Only on the *transition* to ready | If you don't read everything, **you'll never be told again** |
+
+**And the catch that connects directly to Unit 4:**
+
+> **`epoll` cannot watch a regular file on disk.**
+
+A disk file has no meaningful "ready" transition — it's either already in the page cache (always ready) or it isn't (and epoll has no way to learn about it). Readiness notification is a **socket** concept. Disks don't work that way.
+
+This is precisely why Node.js reads files using a **thread pool**. Full explanation in the fd clarification below and Unit 4.
+
+---
+
+### 3.3 — Design B: Completion ("It's done, here's the result")
+
+**The idea:** you hand the OS the work *and* the notification in one go. The kernel **performs the operation itself**, then posts a completion record to a queue you drain later.
+
+```mermaid
+flowchart TB
+    A["1. Submit the operation:<br/>read fd 3, 1024 bytes"] --> B["2. KERNEL performs<br/>the read itself"]
+    B --> C["3. Kernel posts a<br/>completion record<br/>to a completion queue"]
+    C --> D["4. YOU drain the queue<br/>result is already in it"]
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#c8e6c9,stroke:#388e3c
+    style C fill:#c8e6c9,stroke:#388e3c
+    style D fill:#fff9c4,stroke:#fbc02d
+```
+
+**The OS's role is large:** it is not a notifier, it's a **worker**. By the time you hear about it, the work is already done.
+
+### The APIs
+
+| API | Platform | Note |
+|---|---|---|
+| **IOCP** — I/O Completion Ports | Windows | The classic; drives Node.js on Windows |
+| **`io_uring`** | Linux | Modern, faster, the successor to `epoll` |
+
+```c
+// io_uring — you never call read() yourself
+io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd3, buf, 1024, 0);
+io_uring_submit(&ring);                    // hand it to the kernel
+
+n = io_uring_peek_cqe(&ring, &cqe);        // drain completions
+// cqe already contains fd, result byte-count, and the buffer contents
+```
+
+---
+
+### 3.4 — The Precise Difference
+
+This is the table that makes the whole unit click:
+
+| | **Readiness** (`epoll`) | **Completion** (`io_uring`, IOCP) |
+|---|---|---|
+| **The OS says** | *"You may proceed."* | *"It's done. Here's the result."* |
+| **Who performs the read?** | **You** | **The kernel** |
+| **Steps** | **Two**: wait for ready → perform | **One**: submit → reap |
+| **Your process is** | A **worker** | A **reaper** |
+| **The kernel is** | A cheap **notifier** | An expensive **worker** |
+| **Work happens** | In your process | In the kernel |
+| **Multi-queue scaling** | One queue, must loop | **Can have multiple queues<br/>across multiple threads** |
+| **Best for** | Sockets, pipes, anything with a ready-transition | Very high-concurrency I/O, files included |
+
+### The one-line version
+
+> **Readiness says "go." Completion says "done."**
+
+In readiness, the moment of notification and the moment of work are **two separate events**. In completion, they are **the same event** — that is why it is one step instead of two.
+
+---
+
+### 3.5 — The Participant Reframe
+
+Recall Unit 1's framing — different participants experience the same operation differently. Here is how it shifts between the two designs:
+
+| Participant | Readiness design | Completion design |
+|---|---|---|
+| **Your program** | 🔵 Does the actual read work | 🟢 Just collects finished results |
+| **The kernel** | 🟢 Cheap — just reports state | 🔴 Expensive — performs all the I/O |
+| **Cost sits on** | Your process's CPU | The kernel's queues |
+
+**That is the real trade.** Readiness keeps work in your process (cheap kernel, more work for you). Completion pushes work into the kernel (simpler code, heavier kernel).
+
+And it explains a practical difference:
+
+> **Completion scales across cores better**, because you can have several completion queues, each drained by a different thread. Readiness tends to have one dispatcher thread doing the reads.
+
+---
+
+### 3.6 — Node.js Uses Both
+
+Node.js isn't opinionated — it **picks per platform**.
+
+| Platform | Mechanism |
+|---|---|
+| **Linux** | `epoll` → readiness |
+| **Windows** | IOCP → completion |
+| **macOS / BSD** | `kqueue` / `evpoll` → readiness |
+
+> **So the "async I/O" you write in Node.js is actually two different designs underneath, chosen automatically for you.**
+
+### Checkpoint
+
+1. State the problem async creates that synchronous code never had to solve.
+2. In readiness, who performs the read — you or the kernel?
+3. Readiness means "an operation won't block." What does that **not** guarantee about how much data you'll receive?
+4. Why does `epoll` fail when you point it at a regular file on disk?
+5. Your program uses readiness and does heavy processing per event. Your program uses completion and just hands results out. Which is heavier on the kernel?
+6. Readiness is two steps, completion is one. What is the reason for that difference?
+7. Which design lets you scale better across multiple cores, and why?
+
+---
+
+## Clarification — What Is a File Descriptor (fd)?
+
+Unit 3 uses `fd` constantly, so it needs its own explanation. This is not a side note — **it is the mechanism Unit 3 is built on.**
+
+### The Definition
+
+**A file descriptor is just an integer that indexes a table inside your process.** The table maps integers to "things that are open."
+
+```mermaid
+flowchart LR
+    P["Your process"] --> T["File descriptor table<br/>an array of integers"]
+    T --> E0["fd 0"]
+    T --> E1["fd 1"]
+    T --> E2["fd 2"]
+    T --> E3["fd 3"]
+    T --> E4["fd 4"]
+
+    E0 --> R0["stdin<br/>keyboard"]
+    E1 --> R1["stdout<br/>terminal"]
+    E2 --> R2["stderr<br/>error log"]
+    E3 --> R3["a TCP socket<br/>open connection"]
+    E4 --> R4["a file on disk"]
+
+    style T fill:#fff9c4,stroke:#fbc02d
+    style R3 fill:#c8e6c9,stroke:#388e3c
+```
+
+The integer itself carries **no meaning**. `fd 3` isn't special. If your process closes fd 3 and opens a pipe, **fd 3 now refers to the pipe.** The number is just a slot in the array.
+
+### The Ones You Already Use
+
+| fd | Name | Points at |
+|---|---|---|
+| **0** | `stdin` | Input — your keyboard |
+| **1** | `stdout` | Normal output — your terminal |
+| **2** | `stderr` | Errors — also your terminal |
+
+That is why `echo hi 1>&2` redirects "normal output" to "errors" — you're telling the shell to make **fd 1 point at stderr's destination.**
+
+### The Unix Philosophy That Makes This Relevant
+
+Unix's core design idea:
+
+> **"Everything is a file."**
+
+Not a metaphor — a literal design decision. The kernel gives **all** of these the same interface (`read` / `write` / `close`) and the same kind of integer handle:
+
+| Real thing | Is it a file? | Gets an fd? |
+|---|---|---|
+| A file on disk | Obviously | ✅ |
+| A **TCP socket** | Yes | ✅ |
+| A **pipe** (shell `\|`) | Yes | ✅ |
+| stdin / stdout | Yes | ✅ |
+| `/dev/urandom` | Yes | ✅ |
+
+**So a network connection gets a file descriptor**, exactly like a file does. This is the entire reason `epoll` can watch a socket at all — sockets and files share one mechanism.
+
+### Why This Matters for Unit 3
+
+Now the lecture's phrasing makes sense:
+
+```c
+n = epoll_wait(epfd, events, MAX, -1);
+// → "fd 3 is ready to read"
+```
+
+`epoll` is watching a **set of integers**. That is literally all it is. It returns which slots in your table have something to do.
+
+And when your server accepts a connection:
+
+```c
+int client_fd = accept(listen_fd, ...);   // returns a NEW integer, e.g. 7
+// fd 7 now points at the new client's socket
+```
+
+Every connection gets its own fd — which is how you keep track of who's who. That is the practical role of an fd in a backend.
+
+### The Case That Doesn't Work
+
+This resolves Unit 3's central puzzle:
+
+| Resource | fd exists? | Readiness transition? | `epoll` works? |
+|---|---|---|---|
+| TCP socket | ✅ | ✅ data arrives → becomes readable | ✅ |
+| Pipe | ✅ | ✅ writer writes → becomes readable | ✅ |
+| **Regular file on disk** | ✅ | ❌ — always "ready" | ❌ |
+
+A file on disk is **always ready** — there is no state *transition* for `epoll` to observe. There is nothing to notify you about, because "readiness" is decided the instant you call.
+
+> **This is why Node.js reads files with a thread pool instead of `epoll`.** The OS's async mechanism fundamentally cannot express "wait for this disk read," so Node.js delegates it to a real thread that really does block.
+
+### Don't Confuse It With the 4-Tuple
+
+From Lecture 8 you have the **4-tuple**. It is a different concept:
+
+| | What it is | Answers |
+|---|---|---|
+| **fd** | An integer handle **inside your process** | "Which of *my* open things do I mean?" |
+| **4-tuple** (src IP, src port, dst IP, dst port) | Network-layer identity | "Which *connection* on the internet is this?" |
+
+They are related: **one TCP connection ↔ one fd on each side.** But the fd is a *local handle*; the 4-tuple is the *global address*.
+
+### See It Yourself
+
+```bash
+# Watch a process's open fds
+ls -l /proc/<pid>/fd
+
+# Which process is using port 443?
+ls -l /proc/*/fd 2>/dev/null | grep socket
+```
+
+The fd number for stdin/stdout in a shell: `ls -l /proc/self/fd`.
+
+> **The one line to remember: a file descriptor is an integer handle into your process's table of open things — and because Unix treats sockets as files, a network connection gets one too.**
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -533,7 +854,20 @@ That is the bridge to Unit 3: the modern answer is not "remember to sprinkle som
 | **CPU utilisation** | How busy the CPU is *in aggregate* — not the same as your process running |
 | **Message pump / event queue** | The queue `DoEvents` drains to handle pending UI events |
 | **Idle time** | Time spent waiting rather than computing — the real cost of blocking |
+| **File descriptor (fd)** | An integer handle indexing your process's table of open things |
+| **Readiness notification** | The OS tells you an operation won't block; you then perform it |
+| **Completion notification** | The OS performs the operation and tells you it's done |
+| **`poll`** | Ancient readiness API — passes the whole fd list every call |
+| **`select`** | Ancient readiness API — 1024 fd cap, mutates your fd_set |
+| **`epoll`** | Linux readiness API — register fds once, then query all of them |
+| **`kqueue`** | BSD/macOS readiness API, the `epoll` equivalent |
+| **IOCP** | Windows I/O Completion Ports — completion model |
+| **`io_uring`** | Linux completion API — the modern successor to `epoll` |
+| **Level-triggered** | Readiness fires every call *while* ready (safe default) |
+| **Edge-triggered** | Readiness fires only on the *transition* to ready — must read fully |
+| **Completion queue** | The queue the kernel posts finished-operation records to |
+| **Thread pool** | Pre-spawned workers that perform operations the event loop cannot |
 
 ---
 
-*Units 1–2 of 10. Documented from our shared discussion.*
+*Units 1–3 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
