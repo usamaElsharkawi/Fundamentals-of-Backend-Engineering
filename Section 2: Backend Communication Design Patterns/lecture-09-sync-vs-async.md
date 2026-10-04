@@ -1,6 +1,6 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–4 documented)
+## Status: In Progress 🔄 (Units 1–5 documented)
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -936,6 +936,320 @@ for (let i = 0; i < 100; i++) {
 
 ---
 
+---
+
+## Unit 5 — Promises and `async`/`await`: Syntax vs. Reality
+
+Unit 4 gave you the machinery. This unit covers the **three layers of syntax** Node.js puts on top of it — and the crucial fact that `await` *looks* blocking but isn't.
+
+### 5.1 — The Progression
+
+Hussein walks through three eras of the same problem:
+
+```mermaid
+flowchart TB
+    A["Era 1: CALLBACKS<br/>pass a function, get called back<br/>'call me when it's done'"]
+    B["Era 2: PROMISES<br/>get a promise object back<br/>'.then()' on it"]
+    C["Era 3: ASYNC / AWAIT<br/>write it like synchronous code<br/>but it isn't"]
+
+    A -->|"harder to read,<br/>nests badly"| B
+    B -->|"still chainy,<br/>nicer than callbacks"| C
+    C -->|"reads top-to-bottom<br/>like sync code"| D["Same machinery<br/>underneath"]
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#fff9c4,stroke:#fbc02d
+    style C fill:#c8e6c9,stroke:#388e3c
+    style D fill:#ffcdd2,stroke:#c62828
+```
+
+**Critical:** the arrow into the red box. **All three run on the identical event loop + thread pool from Unit 4.** No new capability is added. Only the way you *write* it changes.
+
+> Hussein's verdict on the whole progression: *"We're just playing games here."* Not dismissive — he's pointing out that the "magic" is presentation, not power.
+
+### 5.2 — Era 1: Callbacks
+
+The primitive: **pass a function, get called when the work finishes.**
+
+```javascript
+executeSomething(function whenDone(result) {
+    console.log('work finished:', result);
+});
+```
+
+**The problem:** when work must happen *in sequence*, callbacks nest.
+
+```javascript
+getUser(id, function(user) {
+    getOrders(user.id, function(orders) {
+        getItems(orders[0].id, function(items) {
+            getPrices(items, function(prices) {
+                console.log(prices);
+                // 🔴 four levels deep, real work at the bottom
+            });
+        });
+    });
+});
+```
+
+Known as the **pyramid of doom**. Every real-world callback API has this shape, and it gets worse past three levels.
+
+### 5.3 — Era 2: Promises
+
+A **promise is a container for a value that doesn't exist yet.**
+
+```javascript
+const p = fetchUser(5);        // returns immediately — no user yet
+// p is a Promise: a placeholder that will settle later
+
+p.then(user => console.log(user));    // "when it settles, do this"
+```
+
+Hussein's comparison: *"A promise in Node.js is very similar to futures in C++."*
+
+### The three states
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: promise created
+    pending --> fulfilled: operation SUCCEEDED<br/>value available
+    pending --> rejected: operation FAILED<br/>reason available
+    fulfilled --> [*]
+    rejected --> [*]
+```
+
+A promise starts `pending` and settles **exactly once** — into `fulfilled` or `rejected`. Never both, never twice.
+
+### The chainable version — flattening the pyramid
+
+```javascript
+getUser(id)
+    .then(user => getOrders(user.id))
+    .then(orders => getItems(orders[0].id))
+    .then(items => getPrices(items))
+    .then(prices => console.log(prices))
+    .catch(err => console.error('failed:', err));   // one place for all errors
+```
+
+**Flat. Left-to-right. One error handler.** That was the entire motivation.
+
+| Method | Runs when |
+|---|---|
+| `.then(fn)` | Promise fulfills (pass a 2nd arg to handle rejection) |
+| `.catch(fn)` | Promise rejects |
+| `.finally(fn)` | Always, either way — cleanup |
+
+### 5.4 — Era 3: `async` / `await`
+
+Still fully asynchronous — but it reads top-to-bottom.
+
+```javascript
+async function main() {
+    const user    = await getUser(id);        // pauses HERE
+    const orders  = await getOrders(user.id);
+    const items   = await getItems(orders[0].id);
+    const prices  = await getPrices(items);
+    console.log(prices);
+}
+```
+
+**No indentation. Reads like synchronous code. Looks like it blocks. It doesn't** — which is the whole subject of the next section.
+
+---
+
+### 5.5 — The Key Insight: `await` Suspends, It Does Not Block
+
+This is the single most important thing in the unit.
+
+**First, a correction worth internalising.** This code prints `A`, `B`, `C` — **in that order:**
+
+```javascript
+async function main() {
+    console.log('A');
+    await somethingAsync();
+    console.log('B');
+    console.log('C');
+}
+```
+
+**Output: `A`, `B`, `C`.** Not `A`, `C`, `B`.
+
+All four lines belong to **one execution flow**. When the promise settles, the function resumes at the line after `await` and runs forward normally. `B` is written before `C`, so `B` prints first.
+
+#### The correct rule
+
+> **`await` pauses the async function — it yields control *outside* the function, while preserving order *inside* it.**
+
+Two separate effects that are easy to conflate:
+
+| Effect | What it means |
+|---|---|
+| **Inside the function** | Order is **strictly preserved**. `await` is a **barrier** — nothing after it runs until it settles. |
+| **Outside the function** | Control was **released**. Other code got a chance to run. |
+
+`await` is not "a place where things jump around." It is a **barrier inside your function, and a yield point for everyone else.** Both at once.
+
+#### Where interleaving *does* happen — `C` outside the function
+
+```javascript
+async function doWork() {
+    console.log('A');
+    await somethingAsync();
+    console.log('B');
+}
+
+doWork();          // ← note: NOT awaited
+console.log('C');
+```
+
+```mermaid
+sequenceDiagram
+    participant Caller as Caller top level
+    participant Fn as Async function doWork
+    participant Ev as Event loop
+    Caller->>Fn: call doWork returns a Promise
+    Fn->>Fn: log A
+    Note over Fn: PAUSES here at await<br/>Thread is NOT blocked<br/>Control returns to caller
+    Caller->>Caller: log C
+    Ev-->>Fn: promise settles resume function
+    Fn->>Fn: log B
+    Fn-->>Caller: function ends
+```
+
+**Output: `A`, `C`, `B`** ✅
+
+And note **why** `C` got its chance: `doWork()` was called **without `await`**. The caller didn't wait for it, so the caller carried on immediately.
+
+### This is Unit 2's Lesson, Restated
+
+| | Unit 2 (blocking) | Unit 5 (`await`) |
+|---|---|---|
+| **Thread** | ❌ Suspended — removed from the CPU | ✅ **Free** — runs other callbacks |
+| **Other code** | ❌ Cannot run | ✅ **Runs** — that's the yield |
+| **This function** | ❌ Cannot run | ✅ Paused — order preserved |
+
+A **blocked** thread stops everything, including itself.
+An **`await`ing** function stops only itself, and gives the thread away while it waits.
+
+> **Same word — "waiting." Completely different cost.** That is why Unit 2 needed two separate words and this unit doesn't.
+
+### The two rules
+
+```javascript
+// Rule 1: await may only appear inside an async function
+// (the sole exception: top-level await in an ES module)
+async function ok() { await fetchData(); }
+
+// Rule 2: an async function ALWAYS returns a promise, never a plain value
+async function f() { return 42; }
+f()              // → Promise { 42 }   ← wrapped, automatically
+```
+
+---
+
+### 5.6 — Why We Accept the Illusion
+
+Hussein's answer for why `await` is written to look blocking:
+
+> *"Sometimes you want the code to be in order. If the rest of the code depends on this value, you want your code to go block, wait here until we get the result. But we're not really waiting. We're not blocked. We can do other stuff."*
+
+**Because sometimes the next line genuinely depends on the result.**
+
+```javascript
+const user = await fetchUser(id);
+console.log(user.name);        // 🔴 meaningless without await
+```
+
+Without `await`, `user` is a *Promise object* and `user.name` is `undefined` — the code runs instantly against a placeholder.
+
+So `async`/`await` buys something real:
+
+| Benefit | Why it matters |
+|---|---|
+| **Correct ordering** | The next line *needs* the value |
+| **Readability** | No pyramid, no `.then()` chain |
+| **One error handler** | `try`/`catch` instead of `.catch()` |
+| **Debuggable** | Real stack traces, real line numbers |
+
+> **The rule: `await` when the next line depends on the result. Don't await when it doesn't.**
+
+Because order inside is *enforced*, sequential `await` is how you accidentally author a dependency:
+
+```javascript
+// 🔴 total 3s — the 2s call doesn't start until the 1s finishes
+const a = await fetchA();
+const b = await fetchB();
+
+// ✅ total ≈ 2s — both in flight together
+const [a, b] = await Promise.all([fetchA(), fetchB()]);
+```
+
+> **Awaiting in sequence turns independent work into dependent work.** The barrier is a feature — which is exactly why misusing it is a bug.
+
+---
+
+### 5.7 — Error Handling Differs Across the Three
+
+```javascript
+// Callbacks — error is just another argument. Easy to forget.
+fs.readFile(path, (err, data) => {
+    if (err) { /* 😰 forget this and it crashes later */ }
+});
+
+// Promises — one handler, but you can forget .catch()
+fetchData().then(d => use(d));
+
+// async/await — normal try/catch, the safest of the three
+try {
+    const d = await fetchData();
+    use(d);
+} catch (err) {
+    handle(err);
+}
+```
+
+---
+
+### 5.8 — All Three Are the Same Machine
+
+Strip the syntax away:
+
+| Layer | What it really is |
+|---|---|
+| `async function` | *"Run this; if it hits `await`, park it and return control"* |
+| `await x` | *"If `x` is a Promise, park me until it settles; otherwise continue"* |
+| `Promise` | A container for a future value, with callbacks attached |
+| `.then()` | *"When it settles, call me"* |
+| **Underneath** | **The event loop + thread pool from Unit 4. Nothing else.** |
+
+> **No layer here adds a single new capability. They only change how you *write* the same non-blocking work.**
+
+### Refinement — `await` resumes on the microtask queue
+
+`await` doesn't just resume "when the loop gets around to it." It resumes on the **microtask** queue, which drains *before* the next timer or I/O event:
+
+```javascript
+console.log('1');
+setTimeout(() => console.log('timer'), 0);
+Promise.resolve().then(() => console.log('microtask'));
+console.log('2');
+// Output: 1, 2, microtask, timer
+```
+
+That is why `await` continuations feel instant — they jump the queue relative to timers and I/O.
+
+### Checkpoint
+
+1. Three eras of syntax for the same problem. What machinery sits underneath all three?
+2. A promise has three states. Name them. Which two are terminal?
+3. What does `await` do to the **function**, and what does it do to the **thread**?
+4. All four lines inside one `async function` — what's the output order of `A`, `await`, `B`, `C`?
+5. Under what specific condition does `A → C → B` actually occur?
+6. Why must a function containing `await` be marked `async`?
+7. Two independent calls taking 1s and 2s. Sequential `await` vs `Promise.all` — total time for each? What rule did the first one violate?
+8. Why is forgetting `await` a bug — and what exactly does `await` give you that `.then()` doesn't?
+
+---
+
 ## Clarification — What Is a File Descriptor (fd)?
 
 Unit 3 uses `fd` constantly, so it needs its own explanation. This is not a side note — **it is the mechanism Unit 3 is built on.**
@@ -1096,7 +1410,19 @@ The fd number for stdin/stdout in a shell: `ls -l /proc/self/fd`.
 | **I/O-bound** | Work limited by waiting; threads spend most time blocked, so extra threads are cheap |
 | **Callback queue** | Pending callbacks drained by the event loop when sync code finishes |
 | **Timer starvation** | Long synchronous code preventing the event loop from running callbacks |
+| **Promise** | A container for a value that doesn't exist yet, with callbacks attached |
+| **`pending` / `fulfilled` / `rejected`** | The three promise states; the latter two are terminal |
+| **Settling** | A promise transitioning once from `pending` to fulfilled or rejected |
+| **`.then()` / `.catch()` / `.finally()`** | Fulfil / rejection / always handlers |
+| **`async` function** | A function that always returns a promise and may contain `await` |
+| **`await`** | Suspends *that function* until a promise settles, preserving its internal order |
+| **Pyramid of doom** | Deeply nested callback indentation |
+| **`Promise.all()`** | Runs promises concurrently and resolves when all settle |
+| **Microtask queue** | Where promise continuations run — drained before timers and I/O |
+| **Top-level await** | `await` at ES module scope, allowed without an enclosing `async function` |
+| **Blocking vs awaiting** | Blocked: whole thread stops. Awaiting: one function pauses, thread is freed |
+| **Mermaid reserved words** | In sequence diagrams, `loop`, `end`, `opt`, `alt`, `par`, `rect`, `box`, `critical`, `break`, `activate`, `note` cannot be used as participant aliases — e.g. naming a participant `Loop` silently breaks the diagram |
 
 ---
 
-*Units 1–4 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
+*Units 1–5 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
