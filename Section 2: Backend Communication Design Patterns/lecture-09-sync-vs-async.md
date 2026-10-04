@@ -1,6 +1,6 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Unit 1 documented)
+## Status: In Progress 🔄 (Units 1–2 documented)
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -289,6 +289,228 @@ Everything after this follows from it:
 
 ---
 
+## Unit 2 — What "Blocked" Actually Means
+
+Unit 1 said sync/async is about **whether you wait**. Now let's see what waiting *actually is* at the machine level — because it is not what most people picture.
+
+### 2.1 — What Blocking Feels Like
+
+Hussein's memory is the perfect illustration. Early VB5 (late 90s), single-threaded:
+
+```javascript
+// In a VB5-style app
+function OnButtonClick() {
+    processEnormousFile();     // takes 20 seconds
+}
+
+button.onClick = OnButtonClick;
+```
+
+While `processEnormousFile()` runs:
+
+| You do this | What happens |
+|---|---|
+| Click the button again | **Nothing.** The button won't even light up. |
+| Drag the window | **Frozen.** |
+| Type into a text field | **Ignored.** |
+| Anything at all | **Ignored.** |
+
+Not "slow." Not "laggy." **Completely unresponsive.** The program is one thread, and that thread is standing still waiting. There is nothing else in the program capable of noticing your click.
+
+> **Blocking doesn't mean "slow." It means "the part of the program that could respond to you is unable to run."**
+
+That distinction matters enormously. Unit 4 shows how async fixes this without the thread ever having to *not* be waiting.
+
+### 2.2 — What the CPU Actually Does
+
+Here is the part that reframes everything. You might assume: *"the program is waiting, so the CPU sits idle."*
+
+**That is not what happens.** The CPU does this:
+
+```mermaid
+flowchart LR
+    subgraph CPU["CPU core - always busy"]
+        direction LR
+        P1["Your process<br/>RUNNING"] --> P2["Process B<br/>RUNNING"] --> P3["Process C<br/>RUNNING"]
+    end
+    P1 -.->|"I/O request!<br/>I can't compute<br/>kicked out"| OFF["Your process<br/>BLOCKED<br/>off the CPU"]
+    OFF -.->|"data arrives<br/>queued to run again"| P1
+
+    style P1 fill:#c8e6c9,stroke:#388e3c
+    style OFF fill:#ffcdd2,stroke:#c62828
+```
+
+The moment your code does I/O, your process **stops executing instructions**. There are no instructions left to run — you are waiting on data.
+
+So the kernel does something almost counterintuitive:
+
+> **"You're blocked. You're not computing anything. Get off the core — I'll put someone else on."**
+
+Your process is **removed from the CPU**, and another process runs in its place. Your instructions, your register values, your position in the code — saved somewhere, so they can be restored later.
+
+**This is the same trick as push (Lecture 8) applied to the CPU itself:** the kernel is now *pushing work onto* the CPU rather than letting it idle.
+
+### 2.3 — The Three Steps of a Context Switch
+
+Whenever your process goes off the core and later comes back, the kernel performs a **context switch**:
+
+```mermaid
+flowchart TB
+    A["1. SAVE<br/>Your process's state:<br/>registers, stack pointer,<br/>program counter"] --> B["2. SWAP IN<br/>Another process's state<br/>restored onto the CPU"]
+    B --> C["3. RUN<br/>The other process executes<br/>for a while"]
+    C -.->|"later"| A
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#fff9c4,stroke:#fbc02d
+    style C fill:#c8e6c9,stroke:#388e3c
+```
+
+**Why it takes three steps:** your process is a *continuation*. It paused mid-function, with live values in registers. To bring it back, the kernel must restore that exact state — otherwise your program would resume with corrupted variables.
+
+> **A context switch is literally "stop one story mid-sentence, bookmark the page, start another story, then come back later."**
+
+### 2.4 — The Cost
+
+Saving and restoring state is **not free**. The kernel must:
+
+- Save ~a dozen CPU registers
+- Save/restore the stack pointer
+- Invalidate/rebuild CPU caches (the new process has different data)
+- Update page tables in some cases
+- Run scheduler bookkeeping
+
+**Order of magnitude: microseconds.** One context switch might be 1–10 µs.
+
+Sounds negligible. It isn't — because:
+
+| Operation | Time |
+|---|---|
+| One context switch | ~1–10 **microseconds** |
+| One disk read | ~1,000,000–10,000,000 **microseconds** (1–10 ms) |
+| One network round trip to another continent | ~100,000,000 **microseconds** (100 ms) |
+
+> **The context switch cost is tiny relative to the I/O — but it happens on *every* switch, in *every* thread, across the whole system, constantly.**
+
+Hussein's phrasing: *"It's microseconds, but I do it a lot. It adds up."*
+
+And it compounds in one direction that matters: **more threads → more switching → more overhead.** Which is why you don't spawn 10,000 threads for 10,000 clients (that's the wall Lecture 14 — Multiplexing — walks straight into).
+
+### 2.5 — The Complete Waste
+
+Now the payoff promised in Unit 1. Here is that participant table — **the same six participants, during a blocking disk read**:
+
+| # | Participant | During those 5ms | Experience |
+|---|---|---|---|
+| 1 | Your program | **Standing still** | 🔴 Blocked |
+| 2 | The kernel | **Standing still**, waiting on the device | 🔴 Blocked |
+| 3 | The disk controller | Reading bytes | 🟢 Working |
+| 4 | The SSD | Fetching cells | 🟢 Working |
+| 5 | Your API's caller | Waiting on the HTTP response | 🔴 Blocked |
+
+```mermaid
+flowchart TB
+    APP["Your program<br/>BLOCKED<br/>nothing to execute"]
+    KRN["Kernel<br/>BLOCKED<br/>waiting on device"]
+    DEV["Disk controller<br/>WORKING"]
+    CPU["CPU<br/>running someone<br/>else's code"]
+
+    APP -->|"nothing to do until data arrives"| KRN
+    KRN -->|"nothing to do until read completes"| DEV
+    DEV -.->|"bytes arrive"| KRN
+    KRN -.->|"wakes your process"| APP
+    CPU -.->|"your process was<br/>kicked off the core"| APP
+
+    style APP fill:#ffcdd2,stroke:#c62828
+    style KRN fill:#ffcdd2,stroke:#c62828
+    style DEV fill:#c8e6c9,stroke:#388e3c
+    style CPU fill:#c8e6c9,stroke:#388e3c
+```
+
+Now look at what Hussein called out:
+
+> *"Neither the kernel is doing any work nor the application is doing any work here. The device is doing all of it."*
+
+And his complaint — worth reading as if you were the process:
+
+> *"Why do you block me here? Why did you take me off the CPU? **I'm just waiting.**"*
+
+**Two participants frozen, doing nothing, while two do all the work.** Your program isn't slow because it's doing difficult work. It's slow because it's *idle*.
+
+> **Blocking doesn't mean "slow." It means "not working." And the CPU capacity you're not using isn't wasted globally — it's just not available *to you*.**
+
+### 2.6 — The Important Nuance
+
+There is a trap in the previous section worth catching, because people get it wrong in the opposite direction.
+
+**"Blocking" does not mean "the CPU is idle."**
+
+The CPU stayed busy the whole time — running *other processes*. That is the whole point of preemptive multitasking: **aggregate CPU utilisation is kept high.**
+
+```mermaid
+flowchart LR
+    subgraph MIS["The misconception"]
+        M1["Your process blocked"] --> M2["CPU sits IDLE"]
+    end
+    subgraph REAL["What actually happens"]
+        R1["Your process blocked"] --> R2["CPU runs OTHER processes"]
+        R2 --> R3["Aggregate CPU<br/>utilisation stays high"]
+    end
+
+    style M2 fill:#ffcdd2,stroke:#c62828
+    style R2 fill:#c8e6c9,stroke:#388e3c
+```
+
+**This is why blocking is normally fine** — and why it is not the problem people think it is:
+
+| Situation | Is blocking bad? |
+|---|---|
+| One process waits on disk while 500 others run | **Totally fine.** The CPU is busy. That is the design working. |
+| Your thread waits, and it was the *only* thing to do | **Bad.** Your latency is pure idle time. |
+
+The CPU being efficient and *your program* being slow are **two different facts**. Only the second one is your problem.
+
+### 2.7 — `DoEvents`: The Hack That Reveals the Problem
+
+Hussein's first language was VB5, and VB5 shipped a function called `DoEvents` for exactly this.
+
+```javascript
+function processEnormousFile() {
+    step1();
+    DoEvents();   // "if the user clicked anything, handle it now"
+    step2();
+    DoEvents();
+    step3();
+}
+```
+
+`DoEvents` pumps the message queue — it lets the single thread **briefly stop waiting and handle UI events** mid-operation.
+
+**The honest truth: it worked, and it was a lie.**
+
+| It did | It didn't |
+|---|---|
+| Made the UI responsive | Make the operation itself faster |
+| — | Make the code simpler |
+| — | Remove the underlying problem |
+| — | Scale to more than one user |
+
+And it introduced a classic bug: the user could click "Delete" *in the middle of* a save operation. `DoEvents` invites re-entrancy into code not designed for it.
+
+> **`DoEvents` is the historical shape of every async solution: break the wait, handle other work, come back. Modern async does the same thing — but *structurally*, not by sprinkling hand-placed calls through your code.**
+
+That is the bridge to Unit 3: the modern answer is not "remember to sprinkle something" — it is "the *system* handles the waiting for you."
+
+### Checkpoint
+
+1. You assume a blocked process means an idle CPU. Correct or incorrect, and what actually happens?
+2. What are the *three* steps of a context switch, and why does restoring require all of them?
+3. A context switch is ~5µs; a disk read is ~5ms. If the switch is 10,000× cheaper than the read, why does the cost matter at all?
+4. During a blocking read, how many of the six participants from Unit 1 are doing useful work? Name them.
+5. Your process is blocked, but the CPU shows 90% utilisation. Is that a contradiction? Explain.
+6. What did `DoEvents` actually fix, and what did it hide?
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -305,7 +527,13 @@ Everything after this follows from it:
 | **Latency** | Time for one operation to complete |
 | **Utilisation** | How much of your available time is spent doing useful work |
 | **Independent work** | Work that does not depend on the pending result — the prerequisite for async paying off |
+| **Context switch** | Saving one process's CPU state and restoring another's |
+| **Preemptive multitasking** | The OS switching the CPU between processes automatically |
+| **Re-entrancy** | Re-entering a function while it is still executing (the `DoEvents` hazard) |
+| **CPU utilisation** | How busy the CPU is *in aggregate* — not the same as your process running |
+| **Message pump / event queue** | The queue `DoEvents` drains to handle pending UI events |
+| **Idle time** | Time spent waiting rather than computing — the real cost of blocking |
 
 ---
 
-*Unit 1 of 10. Documented from our shared discussion.*
+*Units 1–2 of 10. Documented from our shared discussion.*
