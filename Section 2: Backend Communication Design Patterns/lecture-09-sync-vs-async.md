@@ -1,6 +1,6 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–5 documented)
+## Status: In Progress 🔄 (Units 1–6 documented)
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -1250,6 +1250,222 @@ That is why `await` continuations feel instant — they jump the queue relative 
 
 ---
 
+---
+
+## Unit 6 — The Real-Life Analogy, and Why Sync Is a *Client* Property
+
+Hussein says sync/async confused him for a long time until he found a physical example. Then he lands the point that reframes the whole lecture. Both in this unit.
+
+### 6.1 — Synchronous Communication: The Meeting
+
+You're in a meeting with John. You ask him a question:
+
+> *"Hey John — did you actually send that pull request?"*
+
+Now imagine **John doesn't answer.** Just silence.
+
+**It's awkward.** Weird, even. Because:
+
+- You're *talking to him right now*
+- He is *right there*
+- So he's expected to reply *now*
+- If he doesn't, you have to prompt him: *"Where are you?"*
+
+That awkwardness **is** synchronous communication, felt physically.
+
+| Property | In the meeting |
+|---|---|
+| Both parties present | John is here, you're here |
+| Immediate response expected | Silence is socially unacceptable |
+| You cannot proceed without the answer | You need his answer to continue |
+| Waiting is *visible* | Everyone can see you waiting |
+
+### 6.2 — Asynchronous Communication: Email
+
+Now send John an email:
+
+> *"Hey John — did you send that PR?"*
+
+Then close the laptop and go do something else. He might reply in 20 minutes. He might reply tomorrow. **You don't care.** Silence is completely normal with email.
+
+You have **moved on with your life**, and his answer will find you later.
+
+| Property | In email |
+|---|---|
+| Parties not co-present | He's wherever; you're wherever |
+| No immediate response expected | Delay carries no social cost |
+| You proceed independently | You do other work regardless |
+| Waiting is invisible | Nobody knows you're waiting |
+
+**Same message. Different relationship.** And that relationship — *is the person waiting allowed to do other things?* — is exactly the definition of sync vs async.
+
+### 6.3 — The Diagnostic That Actually Works
+
+Hussein's example gives you a test you can use on any situation:
+
+> **"If the other party stayed silent, would it be *awkward*?"**
+>
+> - **Awkward** → synchronous
+> - **Completely normal** → asynchronous
+
+| Channel | Silent other party... | Verdict |
+|---|---|---|
+| Meeting / face-to-face | Very awkward | **Synchronous** |
+| Phone call | Unbearable | **Synchronous** |
+| Email | Totally normal | **Asynchronous** |
+| Slack / Teams | Depends who's typing | **Ambiguous** |
+| GitHub issue comment | Normal for hours | **Asynchronous** |
+
+Chat sits in the middle — and that isn't a flaw in the analogy, it's the truth. A quick back-and-forth in Slack *feels* synchronous; a message you read next morning is completely async. **Same channel, different relationship**, depending on expectations.
+
+> **The "channel" doesn't determine synchronicity. The *expectation of an immediate reply* does.**
+
+### 6.4 — The Reframing: Sync Is a *Client* Property
+
+This is the part that matters for the backend, and it's Hussein's key move.
+
+He's been discussing sync/async in **method calls** — one program calling another. Then he moves it up a level to **Request/Response**, where there are two genuinely separate entities: a client and a server. And then:
+
+> **"Synchronicity is really, if you think about it, it's a client property."**
+
+### Why?
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"sends request"| S["Server"]
+    S -->|"sends response"| C
+    N["The CLIENT decides:<br/>do I wait for this,<br/>or do I move on?<br/><br/>The server has no say.<br/>It writes to the socket either way."]
+    C -.- N
+
+    style C fill:#e3f2fd,stroke:#1976d2
+    style S fill:#c8e6c9,stroke:#388e3c
+    style N fill:#fff3e0,stroke:#f57c00,stroke-dasharray: 4 3
+```
+
+Look at what actually happens on the wire (Lecture 7, Unit 6). The server:
+
+1. receives the request
+2. processes it
+3. writes the response
+
+**At no point does the server "decide" anything about synchronicity.** It can't. It doesn't know whether you're sitting there blocking or whether you walked away to make coffee. The bytes are identical either way.
+
+**Only the client knows which one it's doing.**
+
+> **The client is the only participant that can be synchronous — because it's the only one that has to choose to wait.**
+
+### The two questions that define it
+
+Whenever you see "is this sync or async?", ask:
+
+1. **Who is the party that would have to wait?**
+2. **Did they choose to wait?**
+
+| | Who waits? | Chose to wait? | Verdict |
+|---|---|---|---|
+| Client blocks on `fetch()` | Client | ✅ Yes | **Synchronous** (client's view) |
+| Client `await`s a `fetch()` | Client | ❌ No | **Asynchronous** (client's view) |
+| Server processing the request | Server | ✅ Yes | **Synchronous** (server's view) |
+
+**Same request. Three different experiences.** Unit 1's framing again — now applied to the system as a whole.
+
+### 6.5 — Why No Modern Client Is Synchronous
+
+> *"Almost no client library today is synchronous anymore. It's always asynchronous, because we know we send a lot of requests and network calls, and we want to do other stuff while we send the request."*
+
+Pure Unit 1 + Unit 4 economics:
+
+| If the client blocked... | Consequence |
+|---|---|
+| Per request | You waste the entire latency doing nothing |
+| With many requests | You serialise them for no reason |
+| On a slow network | Your app is unusable |
+| On a fast network | Still wasteful — you have local work available |
+
+So `fetch`, `axios`, `http.request`, database drivers — **all async by default.** Not a style choice; the only sensible default once you understand the cost of blocking.
+
+```javascript
+// What every modern client actually does
+send(request);
+doOtherWork();              // ← the whole point
+onResponse(() => { ... });   // ← called later
+```
+
+### The Node.js Event Loop, Revisited
+
+The client-side dispatcher that does nothing but watch for work:
+
+```mermaid
+flowchart TB
+    EL["Event loop<br/>running continuously"] --> Q1{"Any expired<br/>timers?"}
+    Q1 -->|yes| D1["run their callbacks"]
+    Q1 -->|no| Q2{"Any completed<br/>network responses?"}
+    Q2 -->|yes| D2["run their callbacks"]
+    Q2 -->|no| Q3{"Any pending<br/>callbacks?"}
+    Q3 -->|yes| D3["run them"]
+    Q3 -->|no| EL
+    D1 --> EL
+    D2 --> EL
+    D3 --> EL
+
+    style EL fill:#e3f2fd,stroke:#1976d2
+```
+
+That's the whole client-side architecture in one loop: **keep asking "is anything ready?" — if yes run it, if no go back to sleep.** A continuous readiness check — precisely Unit 3's `epoll` model applied to your own callbacks.
+
+### 6.6 — The Part That Sets Up Unit 7
+
+The consequence, and the reason Unit 7 exists:
+
+**Your client being asynchronous does not make the system asynchronous.**
+
+```mermaid
+flowchart TB
+    subgraph NOW["What you usually assume"]
+        A1["My client doesn't wait<br/>= the system is async"]
+    end
+
+    subgraph ACTUAL["What is actually true"]
+        B1["YOUR client<br/>async - moves on"]
+        B2["The SERVER<br/>still holds the request<br/>open, waiting for you"]
+        B3["Your API's CALLERS<br/>still standing still, blocked"]
+        B1 --> B2 --> B3
+    end
+
+    style NOW fill:#fff3e0,stroke:#f57c00
+    style B1 fill:#c8e6c9,stroke:#388e3c
+    style B2 fill:#ffcdd2,stroke:#c62828
+    style B3 fill:#ffcdd2,stroke:#c62828
+```
+
+**The server is doing synchronous processing** — still executing that handler, still holding that connection, still working on your request. It has no idea you walked away.
+
+And every caller of *your* API? **Synchronous.** They're waiting for your response exactly the way John is not answering you.
+
+> **Making your own client asynchronous is a local optimisation. It frees *you*. It frees nobody else.**
+
+This is the trap Hussein walks straight into:
+
+> *"The client is asynchronous, but the whole thing, the system is synchronous. That's synchronous processing — because the backend still thinks, 'someone is actually waiting for me. I got to finish.'"*
+
+And then the turn:
+
+> **"Now move the lens to the back end."**
+
+That lens move **is** Unit 7, and it's the most important unit in the lecture.
+
+### Checkpoint
+
+1. State the meeting case and the email case. What single question separates them?
+2. Your teammate hasn't replied to your Slack message for three hours. Sync or async? What changed the answer?
+3. Why can a channel like Slack be neither purely sync nor async?
+4. Hussein says synchrony is a *client* property. Why can't the server choose whether the interaction is sync or async?
+5. Your client uses `await`. Your server's handler is still running. Which of the two is synchronous, and why?
+6. Name three reasons no modern HTTP client is synchronous.
+7. You make your own API client fully async. Which participants are *still* synchronous — and who exactly is being hurt?
+
+---
+
 ## Clarification — What Is a File Descriptor (fd)?
 
 Unit 3 uses `fd` constantly, so it needs its own explanation. This is not a side note — **it is the mechanism Unit 3 is built on.**
@@ -1422,7 +1638,12 @@ The fd number for stdin/stdout in a shell: `ls -l /proc/self/fd`.
 | **Top-level await** | `await` at ES module scope, allowed without an enclosing `async function` |
 | **Blocking vs awaiting** | Blocked: whole thread stops. Awaiting: one function pauses, thread is freed |
 | **Mermaid reserved words** | In sequence diagrams, `loop`, `end`, `opt`, `alt`, `par`, `rect`, `box`, `critical`, `break`, `activate`, `note` cannot be used as participant aliases — e.g. naming a participant `Loop` silently breaks the diagram |
+| **Synchronous communication** | Both parties present; silence would be socially awkward (a meeting) |
+| **Asynchronous communication** | Parties independent; silence is normal (email) |
+| **The awkwardness test** | If the other party staying silent would be awkward → synchronous |
+| **Client property** | Only the waiting party can choose synchronicity; the responder has no say |
+| **Local optimisation** | Making your client async frees you but frees nobody else — the server and your callers still wait |
 
 ---
 
-*Units 1–5 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
+*Units 1–6 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
