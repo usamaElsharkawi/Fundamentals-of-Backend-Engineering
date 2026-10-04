@@ -1,6 +1,6 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–3 documented)
+## Status: In Progress 🔄 (Units 1–4 documented)
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -714,6 +714,228 @@ Node.js isn't opinionated — it **picks per platform**.
 
 ---
 
+---
+
+## Unit 4 — The Node.js Trick: Thread Pool + Event Loop
+
+Unit 3 ended with a problem: **`epoll` can't watch a disk file.** Node.js has to read files. This unit is the answer — and it's the most important unit in the lecture, because it's how async actually gets *implemented*.
+
+### 4.1 — The Problem Returns
+
+What Node.js is actually facing:
+
+| Operation | Can `epoll` handle it? | What Node.js must use instead |
+|---|---|---|
+| TCP socket / HTTP data | ✅ Yes | `epoll` / IOCP — event loop handles it |
+| Pipe, stdin | ✅ Yes | `epoll` / IOCP |
+| **Read a file from disk** | ❌ **No** | **Something else** |
+| DNS lookup | ❌ Not really | Something else |
+| `crypto.pbkdf2` (password hashing) | ❌ Not at all | Something else |
+
+**A whole category of blocking operations has no async OS mechanism at all.**
+
+Node.js's solution is the classic engineering trick: **if you can't avoid blocking, move the blocking to somewhere you don't care about.**
+
+### 4.2 — The Trick
+
+Hussein's framing: *"Let someone else be blocked while itself not blocked."*
+
+```mermaid
+flowchart TB
+    subgraph MAIN["Main thread - never blocks"]
+        M1["You call<br/>readFile('big.txt', cb)"]
+        M2["Main thread immediately<br/>runs your NEXT lines"]
+        M3["Main thread stays free<br/>for timers, HTTP, UI"]
+    end
+
+    subgraph POOL["Thread pool - blocks so you don't have to"]
+        T1["Worker thread<br/>calls read(fd)"]
+        T2["Worker thread<br/>is now BLOCKED"]
+    end
+
+    subgraph OSR["OS and device"]
+        K["Kernel"]
+        D["SSD"]
+    end
+
+    M1 -->|"hands off the job"| T1
+    M1 -->|"returns immediately"| M2
+    T1 --> T2
+    T2 --> K
+    K --> D
+    D -.->|"read finished"| K
+    K -.->|"wake worker"| T1
+    T1 -.->|"calls your callback"| M3
+
+    style MAIN fill:#c8e6c9,stroke:#388e3c
+    style POOL fill:#fff9c4,stroke:#fbc02d
+    style T2 fill:#ffcdd2,stroke:#c62828
+```
+
+**The mechanism, step by step:**
+
+1. You call `readFile(...)`
+2. Node.js **hands the job to a worker thread** from its pool
+3. That worker calls the genuinely blocking `read()` and **freezes**
+4. **Your main thread never froze.** It ran your next line immediately
+5. The OS removed the *worker* from the CPU (Unit 2's context switch) — **not your main thread**
+6. The read completes, the worker wakes, and **calls your callback**
+
+> **The blocking didn't disappear. It was relocated to a thread whose blocking you don't feel.**
+
+That's the entire trick. And Hussein's summary of it is the best line in the lecture:
+
+> **"Software is full of tricks. Computers are dumb, and we play tricks on them."**
+
+### 4.3 — Is It *Actually* Async? The Honest Answer
+
+**No.** And you should understand why, because it affects how you scale.
+
+| | Real async (event loop + `epoll`) | Thread pool |
+|---|---|---|
+| Does a thread block? | **No** | **Yes** |
+| What does the kernel do? | Notifies readiness; you read | Actually performs the read |
+| Threads needed for 10,000 concurrent file reads | **1** | **10,000** |
+| Memory per unit of concurrency | One event loop | A whole thread (stack + buffers) |
+
+> **The thread pool doesn't make I/O non-blocking. It makes blocking *someone else's* problem.**
+
+**But** — and this is why it works — **for I/O-bound work, threads spend almost all their time blocked, not computing.** Waking a few sleeping threads costs far less than you'd fear. That's why the trick works in practice.
+
+### 4.4 — The Event Loop: How One Thread Reaps Everything
+
+The thread pool handles what `epoll` can't. But what handles the *thousands of sockets*? **The event loop** — a single thread that owns `epoll` and does nothing but wait and dispatch.
+
+```mermaid
+flowchart TB
+    EL["Event loop thread"] --> P1["timers phase<br/>expired setTimeout and setInterval callbacks"]
+    EL --> P2["poll phase<br/>epoll_wait - any socket ready?"]
+    EL --> P3["check phase<br/>setImmediate callbacks"]
+    EL --> P4["close phase<br/>clean up closed connections"]
+    P1 --> EL
+    P2 --> EL
+    P3 --> EL
+    P4 --> EL
+    EL --> POOL["thread pool<br/>for file, DNS, crypto work"]
+
+    style EL fill:#e3f2fd,stroke:#1976d2
+    style POOL fill:#fff9c4,stroke:#fbc02d
+```
+
+**One thread. Thousands of connections. Zero blocking.**
+
+```javascript
+// This is genuinely all it does, conceptually
+while (true) {
+    run_expired_timers();
+    n = epoll_wait(sockets_ready);      // blocks here - but it's *supposed* to
+    for (each ready socket) {
+        handle_its_event();             // fast, non-blocking
+    }
+    handle_immediate_callbacks();
+}
+```
+
+**The crucial difference from the thread pool:** when a socket is ready, the event loop **does the work itself** — it doesn't hand it to a thread. No thread is created, nothing blocks. That's why Node.js can hold 10,000+ WebSocket connections (Lecture 8's idle cost, amortised across one thread).
+
+### Both mechanisms together — the real architecture
+
+| Work type | Handled by | Blocks a thread? |
+|---|---|---|
+| Sockets, HTTP, timers | **Event loop** (`epoll`/IOCP) | No |
+| File reads, DNS, `crypto` | **Thread pool** (~4 threads) | Yes, but not yours |
+| Your JavaScript callbacks | **Event loop** | No |
+
+### 4.5 — Callbacks: How You Get Notified
+
+Every async Node.js API is built on the same primitive: **"do this later, and call me when it's done."**
+
+```javascript
+const fs = require('fs');
+
+console.log('1');
+const data = fs.readFileSync('test.txt');   // blocking
+console.log('2');
+```
+
+Synchronous — output is always `1`, `2`, then the content.
+
+Asynchronous version:
+
+```javascript
+console.log('1');
+fs.readFile('test.txt', function onReadFinished(err, data) {
+    console.log('3   <- callback ran LATER');
+    console.log(data.toString());
+});
+console.log('2');
+```
+
+Output:
+
+```
+1
+2
+3   <- callback ran LATER
+<contents>
+```
+
+**Look at the ordering.** Line `2` printed **before** the file content — even though the file was ready almost instantly. That's the event loop: your synchronous code runs to completion first, *then* the callback queue gets drained.
+
+> **The callback doesn't interrupt your code. It gets appended to a queue that the event loop drains when your current synchronous run finishes.**
+
+That is why a long synchronous loop starves timers and I/O callbacks — the event loop never gets a turn.
+
+### 4.6 — Sizing the Thread Pool
+
+Node.js defaults to **4 worker threads** (`libuv`'s `UV_THREADPOOL_SIZE`).
+
+| Your workload is | Threads vs. CPU cores | Why |
+|---|---|---|
+| **CPU-bound** (hashing, image processing, compression) | **≈ number of cores** | More threads than cores = pure context-switching thrash (Unit 2's cost) |
+| **I/O-bound** (file reads, DB queries, network waits) | **Can exceed cores** | Threads spend most time **blocked**, not computing — extra threads are nearly free |
+
+```bash
+UV_THREADPOOL_SIZE=8 node app.js    # Linux/macOS
+```
+
+**And this is the practical payoff Hussein emphasises:**
+
+> *"Understanding what the backend is doing lets you configure the heck out of it, and optimize and squeeze all the performance. If you don't understand how things work, you can't optimize anything."*
+
+You can't tune what you can't explain. Why is 4 threads slow for your app? Now you know where to look.
+
+### 4.7 — The Cost of the Trick
+
+One real cost, so you aren't surprised:
+
+```javascript
+// 100 tiny file reads
+for (let i = 0; i < 100; i++) {
+    fs.readFile(`file${i}.txt`, callback);   // queued to 4 threads
+}
+// → 100x thread hand-off + context switch
+//
+// vs ONE read of a directory listing:
+// → 1 file read
+```
+
+**The thread pool makes many *small* operations expensive.** Batch them, or use streams, or read a directory instead of 1000 files.
+
+> **Rule of thumb: the thread pool is a fallback for operations the OS can't make async. The event loop is the fast path. Prefer fewer, larger operations.**
+
+### Checkpoint
+
+1. `epoll` can't watch a disk file. What does Node.js do instead?
+2. In the thread-pool trick, whose thread actually blocks — yours or the worker's?
+3. Honest question: is the thread pool *genuinely* non-blocking, or is it a relabeling? Why does it still work in practice?
+4. Which Node.js mechanism handles a WebSocket message, and which handles `fs.readFile`?
+5. Your app holds 100 concurrent WebSocket connections. Roughly how many threads are involved?
+6. You have 4 CPU-bound workers on a 2-core machine. What happens, and why?
+7. Your app does 1000 individual `fs.readFile` calls for 1000 small files. Why is that slow, and what's the fix?
+
+---
+
 ## Clarification — What Is a File Descriptor (fd)?
 
 Unit 3 uses `fd` constantly, so it needs its own explanation. This is not a side note — **it is the mechanism Unit 3 is built on.**
@@ -867,7 +1089,14 @@ The fd number for stdin/stdout in a shell: `ls -l /proc/self/fd`.
 | **Edge-triggered** | Readiness fires only on the *transition* to ready — must read fully |
 | **Completion queue** | The queue the kernel posts finished-operation records to |
 | **Thread pool** | Pre-spawned workers that perform operations the event loop cannot |
+| **Event loop** | Single thread that waits for readiness and dispatches callbacks |
+| **libuv** | The C library under Node.js that implements the event loop and thread pool |
+| **`UV_THREADPOOL_SIZE`** | Env var controlling Node.js worker-thread count (default 4) |
+| **CPU-bound** | Work limited by computation; more threads than cores only adds thrash |
+| **I/O-bound** | Work limited by waiting; threads spend most time blocked, so extra threads are cheap |
+| **Callback queue** | Pending callbacks drained by the event loop when sync code finishes |
+| **Timer starvation** | Long synchronous code preventing the event loop from running callbacks |
 
 ---
 
-*Units 1–3 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
+*Units 1–4 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
