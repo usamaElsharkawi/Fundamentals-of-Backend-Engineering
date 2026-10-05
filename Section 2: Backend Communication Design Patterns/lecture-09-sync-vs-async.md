@@ -1,6 +1,17 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–7 documented)
+## Status: Paused ⏸️ (Units 1–7 studied · Units 8–10 explained only, not yet studied)
+
+> ### 📋 Read this before continuing
+>
+> | Units | State | What that means |
+> |---|---|---|
+> | **1–7** | ✅ **Studied** | We worked through these together. Concepts were questioned, corrected, and confirmed. |
+> | **8–10** | 📋 **Explained only** | Written from the lecture transcript. **We have not discussed them yet.** Treat as a first pass, not as settled understanding. |
+>
+> **Units 8–10 have open questions.** They are listed at the bottom of this doc under *Open Questions for the Revisit*. When we return, expect to correct, expand, or discard parts of them — exactly as happened with the `await` ordering correction in Unit 5.
+>
+> **Do not cite Units 8–10 as understood.** They are scaffolding.
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -1753,6 +1764,323 @@ Async backend processing pays off when the work is **long**, the client **has ot
 
 ---
 
+---
+
+## Unit 8 — Postgres: WAL and Asynchronous Commit
+
+> 📋 **Explained only — not yet studied.** First pass from the transcript. Revisit pending.
+
+### 8.1 — The Problem
+
+Every database faces the same question when you write:
+
+> **"Did the data actually reach the disk?"**
+
+Checking costs time. So every database makes a trade between **durability** and **speed** — and Postgres exposes that trade directly as a setting.
+
+### 8.2 — WAL: Two Structures, Not One
+
+Postgres doesn't write your rows straight to the data pages. It uses a **Write-Ahead Log (WAL)**.
+
+| Structure | Size | Contents |
+|---|---|---|
+| **WAL** | Tiny, compressed | A **journal of changes** ("row 5 updated to X") |
+| **Pages** | Large | The **actual data** — full columns, rows, everything |
+
+```mermaid
+flowchart LR
+    A["UPDATE users<br/>SET name = 'Bob'"] --> W["1. Append to WAL<br/>small, fast, sequential"]
+    A --> P["2. Update the page<br/>in memory"]
+    W --> FL["3. Flush WAL to disk<br/>the durability point"]
+    P --> LA["4. Lazily write pages<br/>later, in the background"]
+
+    style W fill:#e3f2fd,stroke:#1976d2
+    style FL fill:#c8e6c9,stroke:#388e3c
+    style LA fill:#fff3e0,stroke:#f57c00
+```
+
+**The WAL is a journal, not the data.** And that's the clever part:
+
+> **Flushing a small sequential journal is far cheaper than flushing whole data pages.** So Postgres flushes the WAL first, and treats that as "committed."
+
+### 8.3 — Recovery
+
+If the server crashes, Postgres reads the WAL and replays it:
+
+```mermaid
+flowchart LR
+    C["Crash!"] --> R["Read the WAL from<br/>the last known good point"]
+    R --> RP["Load those pages into memory"]
+    RP --> RA["Re-apply every WAL entry<br/>onto the pages"]
+    RA --> RF["Flush the pages"]
+    RF --> OK["Recovered to a<br/>consistent state"]
+
+    style OK fill:#c8e6c9,stroke:#388e3c
+```
+
+**That's why flushing the WAL alone is enough.** Even if the pages never made it to disk, the log contains everything needed to rebuild them.
+
+### 8.4 — Synchronous vs Asynchronous Commit
+
+| | Synchronous commit (default) | Asynchronous commit |
+|---|---|---|
+| **Client blocked?** | ✅ Yes — until the WAL hits disk | ❌ No — returns immediately |
+| **WAL flush** | Waits for it | Kicks it off, doesn't wait |
+| **Durability** | Guaranteed | **At risk** — a crash can lose it |
+| **Speed** | Slower | Faster |
+| **Applies when** | Every `UPDATE` without `BEGIN`/`COMMIT` | Many small transactions |
+
+**The critical surprise — autocommit:**
+
+> *"Technically, if you do an INSERT without a transaction, we begin, then commit. Autocommit is effectively on."*
+
+So a single `UPDATE` still pays a commit. With thousands of small updates, synchronous commit means **thousands of disk round trips.** That's why async commit exists.
+
+**The risk, stated plainly:** with async commit, the server can return *"success"* and then lose the data if the write fails or the machine dies. Readers would then see **dirty reads**.
+
+### 8.5 — The Same Trade, One Layer Down
+
+| Layer | What waits | Setting |
+|---|---|---|
+| Application | Client waits for response | Unit 7's queue |
+| Database | Client waits for WAL flush | `synchronous_commit` |
+| OS | Does the write go straight to disk? | `fsync` → Unit 9 |
+
+> **Same question at every layer: "do I wait for the durable write, or do I hope it lands?"**
+
+**Open question for the revisit:** the ACID properties — Hussein only touches **durability** here. Is async commit still "ACID"? Which letter breaks, and does it matter?
+
+---
+
+## Unit 9 — OS Async I/O, Async Replication, and `fsync`
+
+> 📋 **Explained only — not yet studied.** First pass from the transcript. Revisit pending.
+
+### 9.1 — Readiness vs Completion, Again
+
+Unit 3 covered both designs. Hussein returns to it at the OS level:
+
+| API | Design | What you ask |
+|---|---|---|
+| `epoll` | Readiness | *"Is there something to read on these fds?"* |
+| `io_uring` | Completion | *"Do this I/O and tell me when it's finished"* |
+
+**The critical distinction Hussein emphasises:** readiness tells you data is *available*; completion tells you the *operation is done*. Readiness still requires you to perform the read yourself.
+
+And the reminder from Unit 3 stands:
+
+> **Neither works on regular files.** Readiness has no transition to observe; there's no reason a disk file couldn't be watched the way a socket can.
+
+### 9.2 — Asynchronous Replication
+
+A primary database writes; replicas follow, typically serving reads.
+
+```mermaid
+flowchart TB
+    C["Client"] --> P["Primary<br/>receives the write"]
+    P --> R1["Replica 1"]
+    P --> R2["Replica 2"]
+
+    P -.->|"SYNC: wait for replicas<br/>to confirm before replying"| S1["Both models meet here"]
+    P -.->|"ASYNC: reply now,<br/>replicas catch up later"| S1
+
+    style P fill:#e3f2fd,stroke:#1976d2
+    style R1 fill:#c8e6c9,stroke:#388e3c
+    style R2 fill:#c8e6c9,stroke:#388e3c
+    style S1 fill:#fff9c4,stroke:#fbc02d
+```
+
+| | Synchronous replication | Asynchronous replication |
+|---|---|---|
+| **Commit waits?** | ✅ Yes — for replicas | ❌ No |
+| **Mechanism** | Two-phase commit / Paxos-style agreement | Fire and forget |
+| **Client blocked?** | ✅ Yes, until replicas confirm | ❌ No |
+| **Consistency** | Strong — replicas never lag | **Eventual** — replicas can lag |
+| **Availability** | 🔴 If a replica dies, writes stop | ✅ Writes continue |
+| **Trade** | Consistency for availability | Availability for consistency |
+
+> **Same trade as everywhere else: do you wait for durability, or accept that it might not have landed?**
+
+**Open question:** where exactly does synchronous replication sit between "async processing" and "synchronous processing"? Is it a third category, or a tunable point on a spectrum?
+
+### 9.3 — `fsync`: The Last Layer Down
+
+This is Hussein's most opinionated segment.
+
+**When you write a file, it does *not* go to disk.**
+
+```mermaid
+flowchart LR
+    A["Your write()"] --> P["OS page cache<br/>in RAM — NOT the disk"]
+    P -->|"immediately<br/>your write returns"| DONE["Write appears complete"]
+    P -.->|"later, batched<br/>by the OS"| D["Actually on disk"]
+
+    style P fill:#fff9c4,stroke:#fbc02d
+    style D fill:#e8f5e9,stroke:#388e3c
+```
+
+**Why the OS does this — three real reasons:**
+
+| Reason | Explanation |
+|---|---|
+| **Batching** | Many small writes become one large sequential write — far faster |
+| **SSD wear** | Flash must be erased before writing. Constant small writes destroy the drive. Pages have a finite write lifespan. |
+| **Random vs sequential** | Seeking for scattered single-byte writes is brutally slow; sequential is fast |
+
+### 9.4 — Why Databases Hate It
+
+```mermaid
+flowchart TB
+    subgraph APP["Normal application"]
+        A["write('x')"] --> B["Returns instantly<br/>OS caches it"]
+    end
+
+    subgraph DB["What a database needs"]
+        C["COMMIT"] --> D["fsync() — bypass the cache,<br/>force it to the actual disk"]
+        D --> E["Only NOW do I<br/>tell the client 'success'"]
+    end
+
+    style B fill:#c8e6c9,stroke:#388e3c
+    style D fill:#ffcdd2,stroke:#c62828
+```
+
+> **A database cannot accept "it probably landed." Its entire job is to promise that the data is durable.**
+
+So databases call `fsync` and pay the cost. And here's Hussein's punchline:
+
+> *"Linux doesn't like it at all. He thinks that the database people… he actually mentioned it twice, because of all these workarounds and hacks."*
+
+Linus Torvalds has publicly complained about database workloads forcing the kernel into slow synchronous paths — and databases respond that durability guarantees are precisely what they're *paid* to provide.
+
+**Open question:** is `fsync` slow because of hardware, or because the kernel's design makes it slow? The answer decides whether this is fixable.
+
+### 9.5 — The Pattern Across All Three Units
+
+```mermaid
+flowchart TB
+    U7["Unit 7 - Application<br/>Wait for the job?<br/>queue + job ID"]
+    U8["Unit 8 - Database<br/>Wait for the WAL flush?<br/>synchronous_commit"]
+    U9["Unit 9 - OS and disk<br/>Wait for the physical write?<br/>fsync"]
+
+    U7 -->|"same question"| U8
+    U8 -->|"same question"| U9
+
+    style U7 fill:#e3f2fd,stroke:#1976d2
+    style U8 fill:#fff9c4,stroke:#fbc02d
+    style U9 fill:#ffcdd2,stroke:#c62828
+```
+
+| Layer | The question | Say yes → | Say no → |
+|---|---|---|---|
+| **Application** | Wait for the work? | Synchronous handler | Queue + job ID |
+| **Database** | Wait for the WAL flush? | Synchronous commit | Async commit |
+| **OS / disk** | Force it to the disk? | `fsync` | Rely on the page cache |
+
+> **This is the spine of the entire lecture: at every layer, someone must decide whether to wait for durability or hope it lands. Asynchronous is simply the decision to not wait.**
+
+**Open question:** who pays when you choose "don't wait" at three layers simultaneously? Is the risk compounded or does one layer's caution cover the others?
+
+---
+
+## Unit 10 — The Demo and the Summary
+
+> 📋 **Explained only — not yet studied.** First pass from the transcript. Revisit pending.
+
+### 10.1 — The Demo
+
+Hussein writes two identical-looking Node.js files to make the difference concrete.
+
+**Synchronous version:**
+
+```javascript
+const fs = require('fs');
+
+console.log('1');
+const data = fs.readFileSync('test.txt');   // ← blocks the thread
+console.log('2');
+console.log(data.toString());
+```
+
+**Output:**
+```
+1
+2
+<contents>
+```
+
+**Asynchronous version:**
+
+```javascript
+const fs = require('fs');
+
+console.log('1');
+fs.readFile('test.txt', function(err, data) {
+    console.log('3');                  // ← callback runs later
+    console.log(data.toString());
+});
+console.log('2');
+```
+
+**Output:**
+```
+1
+2
+3
+<contents>
+```
+
+**What the ordering proves:** `3` comes after `2` — the callback did not interrupt the synchronous code. It waited until the current run finished. This is Unit 5's "order inside is preserved, order outside is not."
+
+One detail from the demo worth noting: `readFile` yields a **Buffer**, not a string, so `.toString()` is needed to see the content. The `err` argument is `null` on success.
+
+### 10.2 — The Full Mental Model
+
+```mermaid
+flowchart TB
+    A["The one question:<br/>can I do work while I wait?"] --> B["Blocked<br/>whole thread stops<br/>Units 1-2"]
+    A --> C["Awaiting<br/>one function pauses,<br/>thread is freed<br/>Unit 5"]
+    A --> D["Async processing<br/>respond with a handle,<br/>work happens elsewhere<br/>Unit 7"]
+
+    B --> E["All three are the SAME decision:<br/>wait, or don't wait?<br/>The only question is<br/>WHO is waiting, and WHAT they're waiting for."]
+
+    style A fill:#fff9c4,stroke:#fbc02d
+    style B fill:#ffcdd2,stroke:#c62828
+    style C fill:#e3f2fd,stroke:#1976d2
+    style D fill:#c8e6c9,stroke:#388e3c
+    style E fill:#fff9c4,stroke:#fbc02d
+```
+
+### 10.3 — The Spine of the Whole Lecture
+
+> **At every layer — your client, your handler, your database, your OS, your disk — someone is deciding whether to wait for something to complete. Asynchronous is simply the decision not to wait. Nothing more.**
+
+### 10.4 — Where Sync/Async Lives (from the lecture, briefly)
+
+Hussein adds that this appears at many layers, including ones not covered in detail here — `poll`/`select`/`epoll` and `io_uring` (Unit 9), database commits (Unit 8), and replication (Unit 9).
+
+**Open question:** what other layers exist beyond these? He gestures at operating-system-level async generally — worth mapping properly on the revisit.
+
+### 10.5 — Self-Test
+
+1. Your client is non-blocking. Why is the server still doing synchronous processing?
+2. `epoll` and `io_uring` — which asks "is it ready?" and which asks "is it done?"
+3. Why does `epoll` fail on a regular file?
+4. Postgres flushes the WAL instead of the pages. Why is that cheaper, and why is it sufficient?
+5. With async commit, what has the server *promised* that might turn out to be false?
+6. Synchronous vs asynchronous replication — what do you trade?
+7. Why does the OS batch writes instead of writing straight to disk?
+8. What does `fsync` do, and which layer needs it most?
+9. Name the four layers where "wait or don't wait" is decided.
+10. What is the single question that unifies all of it?
+
+### Checkpoint
+
+1. The demo: why does `3` print after `2`?
+2. Give the one-sentence spine of the lecture.
+3. Which of Units 8–10 do you feel least confident about?
+
+---
+
 ## Clarification — What Is a File Descriptor (fd)?
 
 Unit 3 uses `fd` constantly, so it needs its own explanation. This is not a side note — **it is the mechanism Unit 3 is built on.**
@@ -1937,7 +2265,69 @@ The fd number for stdin/stdout in a shell: `ls -l /proc/self/fd`.
 | **Split exchange** | One long request/response become two short ones with a queue in the gap |
 | **Promise that outlived the process** | What a backend queue actually is |
 | **Delivery of the result** | The second half of an async design — polling, SSE, pub/sub, or WebSocket |
+| **WAL (Write-Ahead Log)** | Postgres's small journal of changes; flushing it is the durability point |
+| **Data page** | The structure holding actual rows and columns, written lazily |
+| **Autocommit** | Every statement implicitly wrapped in its own transaction and commit |
+| **`synchronous_commit`** | Postgres setting — whether commit waits for the WAL to hit disk |
+| **Checkpoint** | Postgres's periodic snapshot of pages, bounding WAL replay after a crash |
+| **Synchronous replication** | Replicas must confirm before the primary replies; strong consistency |
+| **Asynchronous replication** | Primary replies immediately; replicas catch up; eventual consistency |
+| **Two-phase commit (2PC)** | Protocol where all participants must agree before committing |
+| **OS page cache** | RAM holding recent writes before they reach the disk |
+| **Write-back / batching** | The OS accumulating writes and flushing them together for speed |
+| **`fsync`** | Force a file's data past the page cache onto the actual disk |
+| **SSD write endurance** | Flash's finite erase/write lifespan — the reason write batching matters |
 
 ---
 
-*Units 1–6 of 10 documented, plus the file-descriptor clarification. Documented from our shared discussion.*
+---
+
+## Open Questions for the Revisit
+
+These are the specific things worth chasing when we come back. Anything marked ❓ is unverified — written from the transcript and not yet checked against reality.
+
+### Unit 8 — Postgres
+
+| # | Question |
+|---|---|
+| 1 | ❓ If `synchronous_commit = off`, **which ACID property actually breaks?** Durability is the obvious answer — but is anything else compromised? Is a database with async commit still legitimately "ACID"? |
+| 2 | ❓ What are Postgres's real-world sync/async commit failure modes in production? Is the loss window "since last checkpoint", or something narrower? |
+| 3 | ❓ How does `synchronous_commit` interact with replication? If commit is async but replication is sync, which one governs the client's wait? |
+| 4 | ❓ What is a **checkpoint**, and how does it relate to the WAL recovery in 8.3? |
+
+### Unit 9 — OS and replication
+
+| # | Question |
+|---|---|
+| 5 | ❓ Is `fsync` slow because of the hardware, or because the kernel's design makes it slow? The answer decides whether it's fixable — and it's the crux of the Torvalds/database argument. |
+| 6 | ❓ Where does synchronous replication sit between "async processing" and "synchronous processing"? A third category, or a point on a spectrum? |
+| 7 | ❓ If you choose "don't wait" at the application, database, *and* OS layers simultaneously — does the risk compound, or does one layer's caution cover the others? |
+| 8 | ❓ Beyond these three, **what other layers make the wait/don't-wait decision?** Unit 10 gestures at "operating system level stuff" without mapping it. |
+
+### Unit 10 — Demo and scope
+
+| # | Question |
+|---|---|
+| 9 | ❓ Run the sync/async demo. Does the observed output match 10.1 exactly? What surprises us? |
+| 10 | ❓ The `readFile` callback signature is `(err, data)`. **Why is `err` first?** What design choice produced that ordering, and is it a mistake? |
+
+### Cross-unit
+
+| # | Question |
+|---|---|
+| 11 | ❓ Unit 7 says a queue is "a promise that outlived the process." Do **RabbitMQ** and **Kafka** actually behave that way? Revisit [`message-brokers-rabbitmq-vs-kafka.md`](message-brokers-rabbitmq-vs-kafka.md) with this framing and check whether it holds. |
+| 12 | ❓ Unit 5's `await` ordering was corrected mid-study. **Are there other claims in Units 1–7 that deserve re-checking?** Name three. |
+
+---
+
+## Where We Left Off
+
+| | State |
+|---|---|
+| **Studied and solid** | Units 1–7 |
+| **Explained, unverified** | Units 8–10 |
+| **Open questions logged** | 12, listed above |
+| **Next lecture** | Lecture 10 — Polling (14min) |
+| **Revisit triggers** | Unit 7's delivery menu points at Lectures 10–13; the broker doc is waiting to be connected to Unit 7 |
+
+**The lecture is paused, not finished.** Units 8–10 remain to be studied properly.
