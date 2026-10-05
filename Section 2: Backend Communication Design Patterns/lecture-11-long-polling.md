@@ -1,15 +1,15 @@
 # Lecture 11: Long Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Unit 1 studied · Units 2–7 not yet delivered)
+## Status: In Progress 🔄 (Units 1–2 studied · Units 3–7 not yet delivered)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **2–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–2** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
+> | **3–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
 >
-> **Unit 1 is the mechanism.** Read it first — Units 2 and 3 are the cost analysis of exactly what Unit 1 describes, and unintelligible without it.
+> **Unit 1 is the mechanism; Unit 2 is the payoff.** Read both in order. Unit 2 lists five wins and — just as importantly — five things long polling makes *worse*, which Unit 3 then prices.
 >
 > **Unit 3 tests a prediction.** [Lecture 10](lecture-10-polling.md) Unit 7.4 predicted that long polling relocates short polling's cost rather than removing it. Hussein appears to confirm this. Unit 3 will press it.
 >
@@ -24,8 +24,8 @@
 | Unit | Content | State |
 |---|---|---|
 | **1** | **The trick** — same request, the server just doesn't reply | ✅ Studied |
-| 2 | Why it works — the empty response is deleted | ⬜ |
-| 3 | The cost — polling moved server-side | ⬜ |
+| **2** | **Why it works** — the empty response is deleted | ✅ Studied |
+| 3 | The cost — polling moved server-side, and disconnect is not a pro | ⬜ |
 | 4 | Why Kafka chose it — backpressure, not the trick | ⬜ |
 | 5 | The remaining gap — it is still not real time | ⬜ |
 | 6 | The demo — the event-loop trap in the `while` loop | ⬜ |
@@ -145,6 +145,173 @@ Hold onto that last line. It's Unit 3.
 
 ---
 
+## Unit 2 — Why It Works
+
+Unit 1 was the mechanism. This unit is the payoff — and the payoff is **bigger than the transcript claims.**
+
+### 2.1 — What Gets Deleted
+
+[Lecture 10](lecture-10-polling.md)'s core finding was the waste:
+
+> 47 of every 48 polls answered *"not ready"* — information the client already had, over a full HTTP round trip.
+
+Hussein's claim:
+
+> *"You did not really waste bandwidth by sending multiple pull requests. The moment Kafka gets a message, it writes back to the client's response. And that's the beauty here… we're less chatty."*
+
+Correct — and the mechanism is subtraction:
+
+```mermaid
+flowchart LR
+    A["SHORT POLLING<br/>4 minute job, 5 second interval"] --> A1["req 1 - not done"]
+    A1 --> A2["req 2 - not done"]
+    A2 --> A3["req 3 - not done"]
+    A3 --> A4["...47 of these ..."]
+    A4 --> A5["req 48 - DONE"]
+
+    B["LONG POLLING<br/>same job, same interval"] --> B1["one request,<br/>held open 240 seconds"]
+    B1 --> B2["DONE,<br/>arrives the instant it is ready"]
+
+    style A fill:#ffcdd2,stroke:#c62828
+    style B fill:#c8e6c9,stroke:#388e3c
+```
+
+> **Long polling doesn't make the empty response cheaper. It deletes it.**
+
+| | Short polling | Long polling |
+|---|---|---|
+| Empty responses | 47 per job | **Zero** |
+| Meaningful responses | 1 | 1 |
+| **Ratio of waste to signal** | **47 : 1** | **0 : 1** |
+
+That is the entire trick. Everything else in this unit is a consequence.
+
+### 2.2 — The Arithmetic
+
+Same job — 4 minutes, 5-second interval:
+
+| | Short polling | Long polling |
+|---|---|---|
+| Requests | **48** | **1** |
+| Bytes on the wire | ~28.8 KB | ~0.6 KB |
+| Connection-handshake events | 48 (or 48 keep-alive events) | 1 |
+| Server lookup operations | 48 | 1 |
+
+**48× fewer requests. ~48× fewer bytes.** Against [Lecture 10](lecture-10-polling.md) Unit 5.2 — 10,000 users × 2,000 rps — this is the difference between a fleet you scale for emptiness and one you don't.
+
+### 2.3 — The Bigger Win Nobody Mentions
+
+Here's the part the transcript undersells. The bandwidth saving is real, but it isn't the best part:
+
+> **Long polling deletes the polling interval as a source of latency.**
+
+Recall [Lecture 10](lecture-10-polling.md) Unit 2.4: short polling's latency floor *is* the interval, because the job could finish at any moment between polls.
+
+| | Short polling (5s interval) | Long polling |
+|---|---|---|
+| Best case | 0s | ~0s |
+| **Average case** | **2.5s** | **~0s** |
+| **Worst case** | **5s** | ~0s |
+| What the client experiences | *usually waiting* | *notified* |
+
+With short polling, the job finished at second 237 of 240 and the client waited 3 more seconds anyway. **The work was done and nobody knew.** With long polling, the response is written the instant the job completes.
+
+> **That is a change in kind, not degree.** Short polling means the client is *usually behind*. Long polling means the client is *only ever as late as the network*.
+
+For a chat app, a live dashboard, or anything where "did it just happen?" is the question — this matters more than bandwidth.
+
+**Two wins, and they're independent:**
+
+| Win | What it removes |
+|---|---|
+| **Bandwidth** | Empty responses |
+| **Latency** | The polling interval as a delay source |
+
+Most treatments of long polling mention only the first.
+
+### 2.4 — The Structural Change
+
+Now the deepest form of this. Look at the *formula*:
+
+```mermaid
+flowchart TB
+    A["SHORT POLLING<br/>requests = duration / interval<br/>4 min job at 5s = 48 requests<br/>6 hour job at 5s = 4,320 requests"]
+    B["LONG POLLING<br/>requests = 1<br/>no matter how long the job runs"]
+
+    A -->|"eliminate the<br/>division, not the<br/>numerator"| B
+    B --> C["Lecture 10 Unit 5.3's pathology -<br/>'long jobs waste the MOST' -<br/>is DELETED, not reduced"]
+
+    style A fill:#ffcdd2,stroke:#c62828
+    style B fill:#c8e6c9,stroke:#388e3c
+    style C fill:#fff9c4,stroke:#fbc02d
+```
+
+| Job duration | Short polling (5s) | Long polling |
+|---|---|---|
+| 30 seconds | 6 requests | **1** |
+| 4 minutes | 48 requests | **1** |
+| 6 hours | 4,320 requests | **1** |
+| 3 days | 518,400 requests | **1** |
+
+> **Long polling doesn't reduce the waste ratio — it removes the formula.** Request count stops being a function of duration.
+
+Recall [Lecture 10](lecture-10-polling.md)'s most uncomfortable finding: **the workloads polling is *for* are the workloads where it wastes most**, because waste = `1 − interval/duration` *rises* with duration. Long polling **kills that pathology outright.** A three-day job costs the same single held connection a three-second job does.
+
+**That's why long polling is the correct answer for long work — not just a cheaper version of the wrong one.**
+
+### 2.5 — The Objection, and Why the Runtime Matters
+
+The obvious objection: *aren't you just re-creating the "client stuck holding a request" problem from* [Lecture 9](lecture-09-sync-vs-async.md)?
+
+Good instinct — and the answer is Lecture 9's own distinction:
+
+```mermaid
+flowchart LR
+    A["LONG POLL = AWAITING<br/>thread freed,<br/>connection held"] --> C["in Node.js this is<br/>nearly free:<br/>event loop, no thread<br/>per connection"]
+    B["LONG POLL = BLOCKED<br/>thread held,<br/>connection held"] --> D["in thread-per-request<br/>servers this is<br/>expensive"]
+
+    style A fill:#c8e6c9,stroke:#388e3c
+    style D fill:#ffcdd2,stroke:#c62828
+```
+
+From [Lecture 9](lecture-09-sync-vs-async.md) Unit 1:
+
+| | Thread | This request |
+|---|---|---|
+| **Blocked** | ❌ Suspended | ❌ Stopped |
+| **Awaiting** | ✅ **Freed** | ✅ Paused, connection held |
+
+**A long poll is *awaiting*, not *blocked*** — provided your runtime models it that way.
+
+| Runtime | Long poll cost |
+|---|---|
+| **Node.js** (event loop, no thread per connection) | Cheap — this is Unit 6's world |
+| **Go** (goroutine per connection, cheap) | Cheap |
+| **Java / thread-per-request** | Expensive — a real thread parked per client |
+| **PHP** (no shared memory, process model) | Awkward — long polls fight the model |
+
+> **The same long polling is nearly free in Node.js and ruinous in a thread-per-request stack.** [Lecture 10](lecture-10-polling.md) Unit 4's "no new protocol" claim holds — but *"cheap"* is a property of the mechanism *and your runtime*.
+
+That last row is why Unit 6's demo — a promise in Node.js — matters, and why it apparently needed extra work to get right.
+
+### 2.6 — What Does NOT Improve
+
+Planting Unit 3, because a unit that only lists wins isn't an analysis:
+
+| | Short polling | Long polling | Verdict |
+|---|---|---|---|
+| Empty responses | 47 | **0** | ✅ Fixed |
+| Detection latency | up to the interval | ~0 | ✅ Fixed |
+| Requests scale with duration | Yes | **No** | ✅ Fixed |
+| **Connections held** | ~1 briefly | **1 for the whole wait** | ❌ **Worse** |
+| **Where the wait is stored** | nowhere (stateless) | **in the request** | ❌ **Worse** |
+| **Survives server restart** | Yes (job in shared store) | **No — the wait dies with it** | ❌ **Worse** |
+| **Client disconnect mid-wait** | Nothing lost, just stop polling | **Result may be undeliverable** | ❌ **New failure** |
+
+Hussein calls disconnect a **pro** — Unit 3 tests that, because the table above suggests it might be the sharpest edge of all.
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -157,10 +324,18 @@ Hold onto that last line. It's Unit 3.
 | **Client-driven** | The client initiates every exchange; the server never speaks unasked |
 | **Backpressure** | Letting the consumer set the pace so it isn't flooded — the reason Kafka chose this |
 | **`maxWaitMillis`** | Kafka's long-poll ceiling on a `Fetch` request; 500ms by default |
+| **Empty response** | A poll's answer of "not ready" — deleted entirely by long polling |
+| **Waste-to-signal ratio** | How many empty responses per meaningful one; 47:1 becomes 0:1 |
+| **Detection latency** | Time between the work finishing and the client learning of it |
+| **Connection budget** | How many open connections a server can hold — the currency long polling spends |
+| **Awaiting vs. blocking** | Whether a held request costs a thread or just a connection |
+| **Held request** | A long poll occupying a connection while the server waits |
 
 ---
 
-## Checkpoint — Unit 1
+## Checkpoints
+
+### Unit 1
 
 1. In one sentence, what is long polling?
 2. What's identical between a short poll and a long poll? What exactly differs?
@@ -169,11 +344,29 @@ Hold onto that last line. It's Unit 3.
 5. While a long poll is silent, is the server blocked? What is it actually doing?
 6. If 500 clients are sitting on silent long polls, what does the server owe them — threads, or something cheaper? Name the thing.
 
+### Unit 2
+
+1. What single thing does long polling delete? Give the waste-to-signal ratio before and after.
+2. Same 4-minute job, 5-second interval: requests, and roughly bytes, for each design?
+3. **The bigger win.** With a 5-second interval, what's the average detection latency for short polling? For long polling? Why is the second one a *categorical* improvement?
+4. Request count for a 6-hour job: short polling vs long polling? Which lecture's finding does that kill?
+5. Is a long poll *blocked* or *awaiting*? Which unit decides that, and what does it depend on?
+6. **Name three things long polling makes worse.** Which one worries you most?
+7. A 3-day job on short polling: how many requests? Now — what's the honest problem with the long-polling answer, given your answer to #4?
+
 ---
 
 ## Open Questions
 
 Logged as we go. ❓ = unverified, first pass.
+
+### Unit 2
+
+| # | Question |
+|---|---|
+| 4 | ❓ Every figure in Unit 2 assumes the client reconnects immediately on timeout. What happens to the "one request" count if a 6-hour job exceeds the server's long-poll timeout and must be re-polled 43 times? Is the formula really deleted, or just made *larger*? |
+| 5 | ❓ Unit 2.5 claims long polling is cheap in Node.js because of the event loop. But each held request still consumes a socket, a buffer, and an entry in the event loop's bookkeeping. **At what connection count does Node.js also start to suffer?** Is "cheap" merely "cheap until it isn't"? |
+| 6 | ❓ The latency win assumes the job's completion is what the client waits for. What if the client needs **intermediate progress** (like Lecture 10's demo)? Does long polling then only deliver the final result, losing progress reporting? |
 
 ### Unit 1
 
@@ -185,4 +378,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Unit 1 of 7 studied together. Units 2–7 awaiting delivery.*
+*Units 1–2 of 7 studied together. Units 3–7 awaiting delivery.*
