@@ -1,17 +1,18 @@
 # Lecture 10: Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–6 studied · Unit 7 not yet delivered)
+## Status: Complete ✅ (Units 1–7 studied)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–6** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–7** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
 >
 > **Units 1–3 are the mechanism; Units 4–5 are the verdict.** The first three explain what polling *is*. The next two weigh it. Read both halves — a pattern understood but not evaluated is useless, and a pattern evaluated without its mechanism is unfair.
 >
-> **Unit 6 answered the claim we flagged before Unit 1** — and found six bugs Hussein never mentions. One claim remains open: **"long polling is used by Kafka,"** which Unit 7 addresses.
+> **Every claim in this lecture was tested rather than accepted.** Three corrected, four gaps the transcript never mentioned were found. See *Unit 7.8*.
+>
+> **Unit 7.4 made a prediction about long polling — relocated cost, not removed cost. [Lecture 11](lecture-11-long-polling.md) tests it.**
 
 > **How to read this doc:** Each unit builds on the previous. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -27,7 +28,7 @@
 | **4** | **The upside** — simplicity, compatibility, safe resume, zero idle cost | ✅ Studied |
 | **5** | **The bill** — the scaling math, and why 98% is waste | ✅ Studied |
 | **6** | **The demo** — six bugs hiding in 25 lines of "elegant" code | ✅ Studied |
-| 7 | Recap — and what Long Polling exists to fix | ⬜ |
+| **7** | **Recap** — the Kafka answer, the ladder, and what we corrected | ✅ Studied |
 
 **Why the order matters:** Units 4 and 5 are a matched pair — you cannot weigh a pattern before you understand it, and you cannot judge it fairly before you've said what's good about it. Unit 5's cost argument is unintelligible without Unit 2's exact description of what each poll costs.
 
@@ -981,6 +982,200 @@ The honest reading: **Unit 5's numbers describe a system that must already be bu
 
 ---
 
+## Unit 7 — Recap, and the Kafka Answer
+
+Final unit. This one closes the loop, settles the last open claim, and hands us the ladder that lectures 11–13 climb.
+
+### 7.1 — Six Units, One Arc
+
+```mermaid
+flowchart TB
+    U1["Unit 1 - THE PROBLEM<br/>long work needs a handle,<br/>not a result"]
+    U2["Unit 2 - THE MECHANISM<br/>three lifetimes;<br/>every poll is a request/response"]
+    U3["Unit 3 - THE WORD<br/>lookup not wait;<br/>state not delivery"]
+    U4["Unit 4 - THE UPSIDE<br/>simple, compatible, resumable,<br/>zero idle cost"]
+    U5["Unit 5 - THE BILL<br/>2,000 rps for one bit;<br/>~98% waste"]
+    U6["Unit 6 - THE DEMO<br/>six bugs - all predicted<br/>before we found them"]
+
+    U1 --> U2 --> U3 --> U4 --> U5 --> U6
+
+    style U1 fill:#e3f2fd,stroke:#1976d2
+    style U3 fill:#fff9c4,stroke:#fbc02d
+    style U5 fill:#ffcdd2,stroke:#c62828
+    style U6 fill:#fff9c4,stroke:#fbc02d
+```
+
+### 7.2 — The Spine
+
+> **Polling trades certainty for freedom.** The client gives up *having* the result and holds a *reference* instead — then buys the result back with repeated ordinary requests. Cheap to build, cheap to run, honest about failure — and wasteful, latency-bound, and useless at scale until the store is fixed.
+
+Three compressed claims, each earned:
+
+| | |
+|---|---|
+| **The core idea** | Return a **handle**, not a result — then read state until it changes (Units 1–3) |
+| **Why it's good** | No new protocol, works through anything, resumable, zero idle cost (Unit 4) |
+| **Why it fails** | Every empty poll is a request that learns nothing, and the store is where correctness lives (Units 5–6) |
+
+### 7.3 — The Kafka Claim, Settled
+
+Hussein's closing line:
+
+> *"We're going to talk about a better approach which is used by Kafka. It's called Long Polling."*
+
+**He's right that Kafka uses long polling — and wrong that this is what makes Kafka Kafka.**
+
+Kafka's `Fetch` API genuinely is long polling: the broker holds the request up to `maxWaitMillis` (default 500ms) rather than returning empty immediately. That's real, and it's long polling.
+
+But here's what long polling **cannot** do:
+
+```mermaid
+flowchart LR
+    A["LONG POLLING gives you<br/>the NEXT thing,<br/>once"] --> C["miss it while<br/>disconnected?<br/>GONE"]
+    B["KAFKA gives you<br/>everything SINCE offset X,<br/>as many times as needed"] --> D["miss it?<br/>re-read from<br/>your last offset"]
+
+    style C fill:#ffcdd2,stroke:#c62828
+    style D fill:#c8e6c9,stroke:#388e3c
+```
+
+| | Short polling | Long polling | Kafka |
+|---|---|---|---|
+| Empty responses | Many | Few | Few |
+| **Replay a missed event** | ❌ | ❌ | ✅ **From an offset** |
+| **Ordering guarantee** | ❌ | ❌ | ✅ **Total, per partition** |
+| Retention | TTL on your result | While connected | **The whole log** |
+| Consumers | Each polls | Each holds a request | **Consumer groups** |
+
+> **Long polling gives you efficiency. Kafka's log gives you replay.** Different problems. Long polling is the wire protocol; the offset log is the design.
+
+**And long polling is a poor reason to study Kafka.** If you need long polling's efficiency, Lecture 11 gives that in one concept. If you need replay, ordering, and durable retention — that's a broker, and [`message-brokers-rabbitmq-vs-kafka.md`](message-brokers-rabbitmq-vs-kafka.md) is where that lives.
+
+### 7.4 — Long Polling Fixes the Waste — and Reopens Lecture 8's Problem
+
+This is the part worth dwelling on, because long polling is often sold as a pure win. It isn't:
+
+```mermaid
+flowchart TB
+    subgraph SP["Short polling"]
+        A1["N short requests"] --> A2["server holds NOTHING<br/>between polls"]
+        A2 --> A3["but ~98% of the<br/>requests answer 'no'"]
+    end
+
+    subgraph LP["Long polling"]
+        B1["N requests,<br/>held open"] --> B2["server waits until<br/>it has something"]
+        B2 --> B3["but now it holds N<br/>OPEN CONNECTIONS -<br/>Lecture 8's problem,<br/>returned"]
+    end
+
+    style SP fill:#fff9c4,stroke:#fbc02d
+    style LP fill:#e3f2fd,stroke:#1976d2
+```
+
+> **Short polling: stateless server, wasteful traffic. Long polling: efficient traffic, stateless-in-name but N held connections.** You choose which cost you pay — you don't get to pay neither.
+
+And notice **Unit 6's problem survives long polling unchanged**: the waiting job still has to live somewhere the server can see. Long polling holds it *in the request*, which is the least durable place of all. **It doesn't fix the shared-store bug — it hides it.**
+
+> ✅ **Confirmed in Lecture 11.** Hussein's own summary: *"We effectively move the polling from the client side to the server side."* See Lecture 11 Unit 3.
+
+### 7.5 — The Ladder
+
+Now we can see where lectures 11–13 go, and why each exists:
+
+```mermaid
+flowchart TB
+    L10["10 - SHORT POLLING<br/>many short requests<br/>stateless, ~98% wasted"]
+    L11["11 - LONG POLLING<br/>few requests, held until<br/>there's something to say<br/>pays: held connections"]
+    L12["12 - SSE<br/>one connection per client,<br/>server pushes every event<br/>pays: permanent connection"]
+    L13["13 - PUB/SUB<br/>clients talk to a broker,<br/>zero direct client-server links"]
+
+    L10 -->|"fix: stop asking<br/>when there's nothing"| L11
+    L11 -->|"fix: one connection<br/>for all events"| L12
+    L12 -->|"fix: put a broker<br/>between them"| L13
+
+    style L10 fill:#fff9c4,stroke:#fbc02d
+    style L11 fill:#e3f2fd,stroke:#1976d2
+    style L12 fill:#e1bee7,stroke:#8e24aa
+    style L13 fill:#c8e6c9,stroke:#388e3c
+```
+
+**Read it as a series of fixes, not four options.** Each lecture exists because the previous one had a specific defect:
+
+- **Long polling** fixes short polling's *empty responses*
+- **SSE** fixes long polling's *one-request-per-notification*
+- **Pub/Sub** fixes both by *decoupling client from server entirely*
+
+> **Every mechanism here is the same idea at a different point on one axis: how long is the server willing to hold a connection open?** Short polling: not at all. Long polling: until there's something. SSE: forever. Pub/Sub: never — a broker holds the message instead.
+
+That's the mental model to carry into Lecture 11.
+
+### 7.6 — When to Poll, and When Not To
+
+The practical verdict:
+
+| ✅ Poll when | ❌ Don't poll when |
+|---|---|
+| Work takes seconds to minutes | Work finishes in milliseconds — just respond |
+| Clients are flaky (mobile, VPN, captive portals) | You need sub-second updates |
+| You can't deploy a queue yet | Thousands of concurrent watchers per fleet |
+| You want zero idle cost | You need replay or ordering guarantees |
+| Users can afford a few seconds of staleness | Results must never expire — use a real queue |
+
+> **Polling is the baseline and the safety net — rarely the optimum.** Reach for it when you want no new infrastructure, or when everything else is blocked. Graduate when Unit 5's numbers start hurting.
+
+### 7.7 — The Idea Worth Carrying to Every Lecture
+
+Not the protocol. **The handle.**
+
+> **Return a reference instead of a result.** Everything durable in backend engineering descends from this.
+
+| Where we'll meet it again |
+|---|
+| Queues and job systems — Unit 1's job ID |
+| Idempotency keys — "don't charge me twice for this request" |
+| Database primary keys |
+| Content-addressed storage — the hash *is* the reference |
+| Kafka offsets — a resumable handle into a log |
+| The message broker doc — the handle survives the process |
+
+Unit 1 looked like a trick for video uploads. It's actually the primitive underneath most of what this course builds.
+
+### 7.8 — What We Corrected
+
+Three transcript claims, tested rather than accepted:
+
+| # | Claim | Verdict |
+|---|---|---|
+| 1 | "Save the job ID, disconnect, another client picks it up" | ⚠️ **Half true** — the client can, the demo's server can't. The resume loop needs *both* halves |
+| 2 | "Long polling — used by Kafka" | ⚠️ **True but beside the point** — Kafka's defining feature is the offset log, not long polling |
+| 3 | "It's a very elegant idea" | ⚠️ **Elegant protocol, zero infrastructure** — and six bugs in 25 lines |
+
+Plus gaps the transcript never mentioned, found by pushing on it:
+
+- **Result TTL** (3.4) — where a result may not arrive becomes where it may expire
+- **Autoscaling** (5.5) — you scale your fleet to serve emptiness
+- **Aliasing** (6.8) — a badly chosen interval makes you blind, not just slow
+- **IDOR** (6.7) — guessable IDs *and* no auth is an open door
+
+> **Six units, three claims corrected, four gaps found, zero accepted on faith.** That's the method, not an accident.
+
+### 7.9 — Self-Test — Whole Lecture
+
+1. Why can't a single long Request/Response handle a 4-minute job? Name all three reasons.
+2. The three lifetimes in a polling system — which one does the client never see?
+3. Why is polling latency bounded below by the interval?
+4. **Delivery vs. state** — which does vanilla request/response use, and what failure does that cause?
+5. What's the worst-case delay for a 5-second interval, and why can't a faster server help?
+6. 10,000 users polling every 5 seconds. Requests per second? Per day?
+7. Why does waste *increase* with job duration?
+8. Three reasons polling survives where SSE doesn't.
+9. Why is one timer per job the wrong shape in Node.js?
+10. What does adding jitter prevent? (Two things.)
+11. Name four bugs in the demo and which unit predicted each.
+12. Why is `randomUUID()` a security fix, not just a collision fix?
+13. What does long polling fix, and what does it cost?
+14. What can Kafka's offset log do that long polling cannot?
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -1093,7 +1288,7 @@ Logged as we go. ❓ = unverified, first pass.
 | # | Question | Due |
 |---|---|---|
 | 4 | ✅ **ANSWERED in Unit 6** — the demo's in-memory dictionary loses every job on restart, and breaks under a load balancer. Client-half of the resume loop works; server-half does not. | Closed |
-| 5 | ❓ Is long polling really "used by Kafka," or is Kafka's model log-based pub/sub with a different reason for long fetches? | Unit 7 |
+| 5 | ✅ **ANSWERED in Unit 7.3** — long polling *is* Kafka's wire protocol, but it's not what makes Kafka Kafka. The offset log is. | Closed |
 
 ### Unit 5 — gaps the numbers opened up
 
@@ -1112,4 +1307,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Units 1–6 of 7 studied together. Unit 7 awaiting delivery.*
+*All 7 units studied together. Three transcript claims corrected, four gaps found.*
