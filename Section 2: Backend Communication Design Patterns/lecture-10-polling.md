@@ -1,17 +1,17 @@
 # Lecture 10: Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–5 studied · Units 6–7 not yet delivered)
+## Status: In Progress 🔄 (Units 1–6 studied · Unit 7 not yet delivered)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–5** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **6–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–6** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
+> | **7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
 >
 > **Units 1–3 are the mechanism; Units 4–5 are the verdict.** The first three explain what polling *is*. The next two weigh it. Read both halves — a pattern understood but not evaluated is useless, and a pattern evaluated without its mechanism is unfair.
 >
-> **One claim from the transcript is still open.** The in-memory store (flagged before Unit 1) gets its answer in **Unit 6**. The "long polling is used by Kafka" claim gets its answer in **Unit 7**.
+> **Unit 6 answered the claim we flagged before Unit 1** — and found six bugs Hussein never mentions. One claim remains open: **"long polling is used by Kafka,"** which Unit 7 addresses.
 
 > **How to read this doc:** Each unit builds on the previous. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -26,7 +26,7 @@
 | **3** | **Why "short"** — and the delivery-vs-state distinction | ✅ Studied |
 | **4** | **The upside** — simplicity, compatibility, safe resume, zero idle cost | ✅ Studied |
 | **5** | **The bill** — the scaling math, and why 98% is waste | ✅ Studied |
-| 6 | The demo — two real bugs hiding in "elegant" code | ⬜ |
+| **6** | **The demo** — six bugs hiding in 25 lines of "elegant" code | ✅ Studied |
 | 7 | Recap — and what Long Polling exists to fix | ⬜ |
 
 **Why the order matters:** Units 4 and 5 are a matched pair — you cannot weigh a pattern before you understand it, and you cannot judge it fairly before you've said what's good about it. Unit 5's cost argument is unintelligible without Unit 2's exact description of what each poll costs.
@@ -752,6 +752,235 @@ So you're trading a cost you can measure precisely against a latency users feel.
 
 ---
 
+## Unit 6 — The Demo
+
+The payoff unit. Two reasons: it makes the pattern concrete in thirty seconds, **and** it contains the answer to the claim flagged before Unit 1 — plus several bugs Hussein doesn't mention.
+
+### 6.1 — What the Demo Does
+
+Reconstructed from his walkthrough (not verbatim — the logic, not the exact code):
+
+```javascript
+const express = require('express');
+const app = express();
+
+const jobs = {};            // jobId -> progress percent
+
+function updateJob(jobId) {
+  setTimeout(() => {
+    if (jobs[jobId] >= 100) return;
+    jobs[jobId] = jobs[jobId] + 10;
+    updateJob(jobId); // keep going until 100
+  }, 5000);
+}
+
+app.post('/submit', (req, res) => {
+  const jobId = Date.now(); // Hussein: "bad idea"
+  jobs[jobId] = 0;
+  updateJob(jobId);
+  res.send(`job:${jobId}`);
+});
+
+app.get('/checkstatus', (req, res) => {
+  const jobId = req.query.jobId;
+  res.send(`job:${jobId} status: ${jobs[jobId]}%`);
+});
+
+app.listen(8080);
+```
+
+And the run:
+
+```
+$ curl -X POST localhost:8080/submit
+job:1759650000000
+
+$ curl "localhost:8080/checkstatus?jobId=1759650000000"
+job:1759650000000 status: 40%
+
+$ ... (repeating)
+job:1759650000000 status: 90%
+job:1759650000000 status: 100%
+```
+
+Then he submits a **second** job and polls both — two independent progress counters running in parallel. That's Unit 2.2's three lifetimes in action, and it's the moment the pattern clicks.
+
+### 6.2 — Why It Works, Honestly Assessed
+
+Before the bugs — the demo is genuinely good teaching:
+
+| It does well | Why that matters |
+|---|---|
+| Whole mechanism in ~25 lines | Proves Unit 4.1's claim rather than asserting it |
+| Two jobs in parallel | Shows job IDs fully decouple work from client |
+| Progress numbers visible | Makes "state, not delivery" (Unit 3.3) tangible |
+
+> **The demo is the pattern. The bugs below are the engineering.** Most real systems are this plus a queue, auth, persistence, and retries.
+
+### 6.3 — Bug 1: `Date.now()` Collides, and Leaks Data
+
+Hussein flags it himself:
+
+> *"I use the time. Bad idea. Of course, if two people happen to have executed in the same millisecond, you're going to get a conflict job ID."*
+
+He's right, and the consequence is **worse than he says**:
+
+```mermaid
+flowchart TB
+    A["Client 1 submits at<br/>10:00:00.123<br/>ID: 1000123"] --> C["jobs[1000123] = 0"]
+    B["Client 2 submits at<br/>10:00:00.123<br/>ID: 1000123 TOO"] --> D["jobs[1000123] = 0<br/>overwrites client 1's<br/>running progress"]
+    C --> E["Both clients now read<br/>ONE shared record"]
+    D --> E
+    E --> F["Client 1 polls and<br/>receives CLIENT 2'S RESULT"]
+
+    style D fill:#ffcdd2,stroke:#c62828
+    style F fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+**This isn't just a lost job — it's two users' data collapsing into one record.** Client 1 could receive client 2's file URL. That's a privacy breach, not a bug.
+
+**Fix:** `crypto.randomUUID()`.
+
+**The principle:** *an identifier that isn't unique is an authorization bypass waiting to happen.*
+
+### 6.4 — Bug 2: The In-Memory Store (Our Flagged Claim, Answered)
+
+This is the claim flagged before Unit 1:
+
+> ❓ *"The client saves the job ID to disk, disconnects, another client can pick it up."*
+
+**Verdict: the client half works. The server half doesn't.**
+
+Look at Unit 4.2's resume loop — the client faithfully persists `a7f3`. Now watch what the server does with it:
+
+```mermaid
+flowchart TB
+    C["Client"] -->|"POST /submit<br/>load balancer picks A"| A["Server A<br/>jobs = { a7f3: 40 }"]
+    C -->|"GET /status<br/>load balancer picks B"| B["Server B<br/>jobs = { }<br/>EMPTY"]
+    B --> R["returns undefined<br/>not the progress"]
+
+    A -.->|"no shared store<br/>exists between them"| B
+
+    style B fill:#ffcdd2,stroke:#c62828
+    style R fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+Three failures, one cause:
+
+| Event | Result |
+|---|---|
+| **Server restart / redeploy** | Dictionary empty. Every job vanishes. |
+| **Two servers behind a load balancer** | Submit to A, poll B → `undefined` |
+| **PM2 cluster / k8s replicas** | Same, permanently — each process has its own dict |
+
+**This is Unit 2.5's option table coming back to collect.** In-memory was the option with **❌ survives restart? ❌ shared across servers?** Those two "no"s were the whole cost. Unit 2 filed it; Unit 6 cashes it.
+
+> **The resume loop from Unit 4.2 is a two-sided protocol. The client must persist the job ID *and* the server must own a durable, shared store. The demo does the first and not the second — so the feature is real but not yet available.**
+
+And the fix is already in our vocabulary: **the queue option.** Redis, Postgres, RabbitMQ — any shared store makes this work. That the demo reaches for neither is exactly why production can't.
+
+### 6.5 — Bug 3: An Unknown Job Returns 200, Not 404
+
+Unit 3.2 promised three outcomes. The demo implements two and conflates them:
+
+```javascript
+jobs["does-not-exist"]              // undefined — no exception thrown
+res.send(`status: ${jobs[jobId]}%`); // "status: undefined%"
+```
+
+The client receives **`200 OK`** with `status: undefined%`. Not a `404`.
+
+| Should be | Demo returns |
+|---|---|
+| `200 {progress: 40}` | ✅ `200 ...40%` |
+| `404` unknown job | ⚠️ **`200 ... undefined%`** |
+
+**Consequence:** a client can't tell "this job doesn't exist" from "this job exists but hasn't started." Its resume loop can't distinguish *keep waiting* from *stop asking* — so it polls a dead ID forever.
+
+That's Unit 3.2's third outcome, missing — and it breaks the resume loop's exit condition.
+
+### 6.6 — Bugs 4, 5, 6 — The Rest
+
+| Bug | In the demo | Consequence | Fix |
+|---|---|---|---|
+| **Unbounded growth** | Completed jobs stay in `jobs{}` forever | Memory grows with every job, ever | **Unit 3.4's TTL** — delete on completion + expiry |
+| **No cancellation** | `updateJob` runs to 100% regardless | Abandoned jobs burn CPU for nothing. No `DELETE` endpoint | A cancel flag the timer checks |
+| **No ownership check** | Any job ID, any caller | **Anyone can read anyone's job** | Scope queries to the authenticated user |
+| **One timer per job** | 10,000 jobs = 10,000 `setTimeout`s in one event loop | Memory + event-loop pressure | **One worker consuming from a queue** |
+
+Two of those deserve more air.
+
+**The timer-per-job pattern is a Node.js-specific mistake**, and it ties straight back to [Lecture 9](lecture-09-sync-vs-async.md) Unit 4. The right shape is **one worker draining a queue** — not N independent timers. Same job, completely different resource profile.
+
+**"No ownership check" is a security bug, not a feature gap** — see 6.7.
+
+### 6.7 — Guessable IDs Are a Second Security Hole
+
+This one isn't a bug in the code — it's a bug in the *ID choice* interacting with the missing auth.
+
+```mermaid
+flowchart TB
+    A["Date.now() is<br/>SEQUENTIAL and GUESSABLE"] --> B["IDs arrive in order:<br/>1000123, 1000124, 1000125..."]
+    B --> C["attacker enumerates:<br/>GET /checkstatus?jobId=1000137"]
+    C --> D["no auth on the endpoint<br/>and no ownership check"]
+    D --> E["reads other users'<br/>progress and results"]
+
+    style A fill:#fff9c4,stroke:#fbc02d
+    style E fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+This is a textbook **IDOR** (Insecure Direct Object Reference). Two mistakes compound:
+
+1. **Guessable IDs** — sequential timestamps are enumerable, not random
+2. **No ownership check** — possessing an ID grants full access
+
+**Either one alone is survivable. Together they're an open door.** Fix one and the door closes; fix both.
+
+And notice: `crypto.randomUUID()` from 6.3 fixes *both* — which is the real reason an ID must be unguessable, not merely non-colliding.
+
+### 6.8 — The Aliasing Trap
+
+One subtle thing in the demo that isn't a bug but will bite you. Progress updates every 5 seconds. A browser polls every 5 seconds. **No jitter, no random offset.**
+
+```mermaid
+flowchart TB
+    T1["server updates progress<br/>t=5 to 10%<br/>t=10 to 20%<br/>t=15 to 30%"] --> T2["client polls at exactly<br/>t=5.0, 10.0, 15.0<br/>no jitter, no offset"]
+    T2 --> T3["the two settle into<br/>a fixed phase<br/>relationship"]
+    T3 --> T4["you may systematically<br/>observe the same value<br/>twice, and never<br/>see an intermediate one"]
+
+    style T4 fill:#fff9c4,stroke:#fbc02d
+```
+
+**When your polling period equals your update period, the two can lock into step.** You re-read the same value, and intermediate changes slip past entirely.
+
+Unit 2.4 called the interval your latency floor. This is the other half: **a badly chosen interval can also make you blind to changes, not just slow to see them.**
+
+> **Fix: add jitter.** Poll at *roughly* the interval, never exactly — `interval + random(0, 500ms)`.
+
+Jitter also prevents **every client in the fleet from polling at the same instant**. Without it, a scheduled job's clients all return at 09:00:00 together and hammer the server in a spike — polling's version of a thundering herd.
+
+### 6.9 — The Verdict
+
+| | |
+|---|---|
+| ✅ **What the demo proves** | The pattern is genuinely simple — 25 lines, two endpoints, no new protocol (Unit 4.1 was true) |
+| ⚠️ **What it hides** | A shared durable store, auth, TTL, cancellation, cancellation-aware scheduling, and jitter |
+| 💀 **What it gets wrong** | ID collisions leaking data · jobs lost on restart · `200 undefined` instead of `404` |
+
+> **The demo is the pattern in 25 lines. Production is the pattern plus six things the demo never had to solve** — and five of those six are things earlier units already predicted.
+
+**Every one of these bugs was flagged before we hit them.** Unit 2.5 predicted the shared-store problem. Unit 3.2 listed the missing `404`. Unit 3.4 predicted unbounded growth. Unit 5 predicted the timer explosion. Unit 4.2 needed a durable store the demo never built.
+
+### 6.10 — Does This Undo Unit 5?
+
+Unit 5 built a careful cost argument about polling at scale. Unit 6 just watched a demo that **doesn't survive a load balancer** — the *precondition* for the scale Unit 5 discussed.
+
+> **Does that change the Unit 5 numbers?** The 2,000 rps figure assumed a working shared store. Without one you never reach scale — you fall over at two servers.
+
+The honest reading: **Unit 5's numbers describe a system that must already be built correctly.** Polling's simplicity applies to the *protocol*, not the *infrastructure*. The demo is a protocol in 25 lines and an infrastructure in zero lines.
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -777,6 +1006,11 @@ So you're trading a cost you can measure precisely against a latency users feel.
 | **Egress** | Traffic leaving your infrastructure — usually the expensive direction |
 | **Keep-alive** | Reusing one TCP/TLS connection across many polls |
 | **Autoscaling** | Adding servers based on measured load — including useless load |
+| **IDOR** | Insecure Direct Object Reference — possessing an ID grants access with no ownership check |
+| **Jitter** | Randomising timing so many clients don't act in lockstep |
+| **Aliasing** | Polling period equal to update period, so the two lock into phase |
+| **Thundering herd** | Every client polling at the same instant, spiking the server |
+| **`randomUUID()`** | Cryptographically random IDs — unguessable and collision-free |
 
 ---
 
@@ -829,6 +1063,17 @@ So you're trading a cost you can measure precisely against a latency users feel.
 8. Two clients poll every 1 second and every 60 seconds. Describe the trade each has made.
 9. If polling's biggest cost is the empty polls, what single change would remove most of it? Hold that thought — Lecture 11.
 
+### Unit 6
+
+1. Reconstruct `updateJob` in words. What is it actually doing, and what would replace it in production?
+2. Two clients submit in the same millisecond. What exactly goes wrong — and why is it worse than "a lost job"?
+3. **Answer the flagged claim:** what happens to a resumed client when the server behind the load balancer restarts? Which unit predicted this?
+4. The demo returns `200 status: undefined%` for an unknown job. What should it return, and what breaks in the client if it doesn't?
+5. Name the four resource leaks in 6.6. Which earlier unit predicted each?
+6. Why are guessable IDs **and** missing auth worse together than separately? Which single fix closes both?
+7. What is aliasing here, and what's the one-word fix? Name the second problem jitter also solves.
+8. In one sentence: what is the demo teaching, and what is it not teaching?
+
 ---
 
 ## Open Questions
@@ -847,7 +1092,7 @@ Logged as we go. ❓ = unverified, first pass.
 
 | # | Question | Due |
 |---|---|---|
-| 4 | ❓ The demo stores jobs in an in-memory dictionary. Does that survive a restart? What happens to a client mid-job? | Unit 6 |
+| 4 | ✅ **ANSWERED in Unit 6** — the demo's in-memory dictionary loses every job on restart, and breaks under a load balancer. Client-half of the resume loop works; server-half does not. | Closed |
 | 5 | ❓ Is long polling really "used by Kafka," or is Kafka's model log-based pub/sub with a different reason for long fetches? | Unit 7 |
 
 ### Unit 5 — gaps the numbers opened up
@@ -867,4 +1112,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Units 1–5 of 7 studied together. Units 6–7 awaiting delivery.*
+*Units 1–6 of 7 studied together. Unit 7 awaiting delivery.*
