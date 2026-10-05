@@ -1,17 +1,17 @@
 # Lecture 10: Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–3 studied · Units 4–7 not yet delivered)
+## Status: In Progress 🔄 (Units 1–5 studied · Units 6–7 not yet delivered)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–3** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **4–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–5** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
+> | **6–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
 >
-> **Units 1–3 are the mechanism — read them before the rest.** They are the load-bearing part: the problem, the shape, and the word "short." Units 4–7 are evaluation and critique; they're much easier once the mechanism is solid.
+> **Units 1–3 are the mechanism; Units 4–5 are the verdict.** The first three explain what polling *is*. The next two weigh it. Read both halves — a pattern understood but not evaluated is useless, and a pattern evaluated without its mechanism is unfair.
 >
-> **Two claims from the transcript are already in question.** One was flagged before Unit 1 (the in-memory store) and one *arose from our own discussion* — the TTL problem in Unit 3.4, which the transcript doesn't address at all. See *Open Questions*.
+> **One claim from the transcript is still open.** The in-memory store (flagged before Unit 1) gets its answer in **Unit 6**. The "long polling is used by Kafka" claim gets its answer in **Unit 7**.
 
 > **How to read this doc:** Each unit builds on the previous. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -24,12 +24,12 @@
 | **1** | **The problem polling solves** — long work, and you need a handle back | ✅ Studied |
 | **2** | **The mechanism** — three lifetimes, and every poll is itself a Request/Response | ✅ Studied |
 | **3** | **Why "short"** — and the delivery-vs-state distinction | ✅ Studied |
-| 4 | The upside — simple, safe disconnect, fits long work | ⬜ |
-| 5 | The downside — the scaling math, and why 99% is waste | ⬜ |
+| **4** | **The upside** — simplicity, compatibility, safe resume, zero idle cost | ✅ Studied |
+| **5** | **The bill** — the scaling math, and why 98% is waste | ✅ Studied |
 | 6 | The demo — two real bugs hiding in "elegant" code | ⬜ |
 | 7 | Recap — and what Long Polling exists to fix | ⬜ |
 
-**Why the order matters:** Units 5 and 6 are where the interesting material is. We only reach them after the mechanism is solid, because the cost argument is unintelligible without knowing exactly what each poll costs.
+**Why the order matters:** Units 4 and 5 are a matched pair — you cannot weigh a pattern before you understand it, and you cannot judge it fairly before you've said what's good about it. Unit 5's cost argument is unintelligible without Unit 2's exact description of what each poll costs.
 
 ### Claims flagged for testing
 
@@ -401,6 +401,357 @@ And this is where polling starts revealing its seams. Unit 5 shows the cost of t
 
 ---
 
+## Unit 4 — The Upside
+
+Units 1–3 established the mechanism. Unit 4 is the case *for* it — and one advantage in here is the most underrated in the whole lecture.
+
+### 4.1 — Simple to Build, on Both Sides
+
+Hussein says it plainly:
+
+> *"It's a very simple thing to implement. The client is very simple to build. And if you think about it, the back end is also relatively simpler to build."*
+
+The entire protocol:
+
+```mermaid
+flowchart LR
+    A["What polling<br/>requires you to build"] --> B["1. a POST that<br/>returns an ID"]
+    B --> C["2. a GET that<br/>reads the store"]
+    C --> D["3. a loop on<br/>the client"]
+    D --> E["that is the<br/>whole protocol"]
+
+    style E fill:#c8e6c9,stroke:#388e3c
+```
+
+Compare what the next three lectures require: SSE needs connection management, event parsing, reconnection with `Last-Event-ID`, and proxy cooperation. WebSocket needs an upgrade handshake, ping/pong, and a persistent connection. **Polling needs a store and two endpoints.**
+
+#### The advantage nobody counts: compatibility
+
+```mermaid
+flowchart LR
+    C["Client"] --> A["Anything that carries HTTP"]
+    A --> L["proxy, CDN, load balancer,<br/>corporate firewall,<br/>mobile network, even curl"]
+    L --> S["Your server"]
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style L fill:#fff9c4,stroke:#fbc02d
+```
+
+**Polling works through every layer that might block a fancier protocol.** Enterprise proxies routinely strip or mangle SSE and WebSocket upgrades. Polling survives because it isn't a special protocol — it's ordinary requests.
+
+> **This is why polling is the fallback, not the naive option.** When SSE or WebSocket fail in production, teams fall back to polling. It's the floor of the design space, and that makes it the safety net.
+
+**Corollary worth internalising:** simplicity isn't only elegance. It's why a technique survives contact with the real world.
+
+### 4.2 — Safe Disconnect, and the Resume Loop
+
+This is the prize. Hussein calls it *"a very attractive feature"*:
+
+> *"The client can disconnect safely in this case… it will persist the moment it receives the job ID or the task ID or the request ID, you can just save it to disk. And then the more the next moment you respawn, you read from disk and these are the pending jobs and you can just loop and say, 'Hey, is this thing ready?'"*
+
+Read that as an algorithm — three moves:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant D as Client storage
+    participant S as Server
+
+    C->>S: POST /submit
+    S-->>C: 202 Accepted, { jobId: "a7f3" }
+    C->>D: persist "a7f3" as pending
+    Note over C,D: browser crashes,<br/>laptop closes,<br/>network drops,<br/>you deploy
+    C->>D: on next launch, read pending jobs
+    D-->>C: a7f3, a9c1, b2e8
+    loop sweep the pending list
+        C->>S: GET /status?jobId=a7f3
+        S-->>C: { done: true, url: "..." }
+        C->>D: remove a7f3 from pending
+    end
+```
+
+#### Why this is bigger than it looks
+
+**You can now lose the client entirely and not lose the work.** Crash, reboot, plane, coffee on the laptop — the pending list survives. On next launch the client *reconciles* it.
+
+Not a trick — it's the exact shape of things you already know:
+
+| What you know | Where you've met it |
+|---|---|
+| Local-first sync engines | Reconcile a local pending-op log on launch |
+| Mobile offline queues | Sync when connectivity returns |
+| `git push` after a failed push | Your commits are local; push later |
+| CI retry queues | Persist the intent, retry later |
+
+> **Persist the intent locally, reconcile against the server on restart.** Polling hands you the ID that makes this possible. That's Unit 1's whole trick paying off.
+
+#### And the condition it depends on
+
+The resume loop only works if the result is **still readable when the client returns** — which is Unit 3.4's TTL, exactly.
+
+```mermaid
+flowchart LR
+    A["Safe disconnect<br/>is a real advantage"] --> B{"is the result<br/>still readable<br/>on return?"}
+    B -->|"yes, generous TTL"| C["feature works,<br/>resilience gained"]
+    B -->|"no, tight TTL"| D["feature breaks,<br/>you resume into a 404"]
+
+    style C fill:#c8e6c9,stroke:#388e3c
+    style D fill:#ffcdd2,stroke:#c62828
+```
+
+> **Unit 3.4 gates Unit 4.2.** The resume loop is only as good as your retention policy — and that policy is yours to choose.
+
+### 4.3 — The Native Fit for Long Work
+
+The third advantage is about *fit* rather than mechanics:
+
+| Work duration | Polling |
+|---|---|
+| 50ms | ❌ Overhead exceeds the work — just respond |
+| 30 seconds | ✅ Fine either way |
+| 4 minutes | ✅ **The right answer** |
+| 6 hours | ✅ Necessary |
+| Unbounded | ✅ The only option |
+
+Polling isn't a compromise for long work. It's the design that makes long work *possible* at all over Request/Response. Unit 1's YouTube example is exactly this.
+
+**The pattern:** choose the mechanism that matches the duration, not the one that looks most modern.
+
+### 4.4 — Zero Idle Cost (the Inverse of Lecture 8)
+
+This one deserves an explicit diagram, because it's the direct mirror of what [Lecture 8](lecture-08-push.md) cost you:
+
+```mermaid
+flowchart TB
+    subgraph PUSH["Push - Lecture 8"]
+        P1["10,000 clients"] --> P2["10,000 OPEN connections<br/>held idle on your server"]
+        P2 --> P3["every heartbeat,<br/>every reconnect,<br/>every dropped socket<br/>is your problem"]
+    end
+
+    subgraph POLL["Polling"]
+        Q1["10,000 clients"] --> Q2["10,000 saved job IDs<br/>in each client's own storage"]
+        Q2 --> Q3["between polls the server<br/>knows nothing<br/>and costs nothing"]
+    end
+
+    style PUSH fill:#ffcdd2,stroke:#c62828
+    style POLL fill:#c8e6c9,stroke:#388e3c
+```
+
+| | Push | Polling |
+|---|---|---|
+| Idle client | Holds a connection, a buffer, a heartbeat | **Holds nothing** |
+| Server must track | Every live client, continuously | Only clients mid-poll |
+| Client drops | Reconnect logic, backoff, resume tokens | **Just poll again** |
+| Protocol changes | WebSocket/HTTP2 upgrade | **None** |
+
+**The trade in one line:** push buys lower latency by paying in permanent server-held state. Polling buys statelessness by paying in wasted requests. Unit 5 prices that bill.
+
+### 4.5 — Also Worth Noticing
+
+**1. Many clients can watch the same job.** Nothing ties a job ID to the client that created it. A second device, a monitoring script, a colleague — all can poll `a7f3`.
+
+```mermaid
+flowchart TB
+    S["Job a7f3<br/>stored on the server"] --> C1["Client A<br/>created it"]
+    S --> C2["Client B<br/>started watching"]
+    S --> C3["A cron job<br/>checking forever"]
+    S --> C4["Nobody<br/>yet"]
+
+    style S fill:#fff9c4,stroke:#fbc02d
+```
+
+Watch the bottom edge of that diagram. **Polling drifts toward pub/sub** — one event, many observers, no coordination. That's [Lecture 13](lecture-13-pubsub.md), already visible. The server has no idea how many watchers exist.
+
+**2. The server's freedom.** Unit 2.5's option table is the point: the backend may queue, persist, or hold in memory, then execute whenever it likes. **Polling decouples the request's lifetime from the work's lifetime** — the request is over in 5ms, the work takes an hour. Nothing forces them together.
+
+---
+
+## Unit 5 — The Bill
+
+Hussein's own transition: *"Nothing is perfect, right?"*
+
+He calls polling **"too chatty"** and then puts numbers on it. Let's do the math properly, because the transcript gestures at it and the actual figures are worse than he states.
+
+### 5.1 — First, a Naming Correction
+
+Before the costs, Hussein stops to correct a term:
+
+> *"It receives a pull request — not pull request, a poll. Request, poll — not GitHub, not 'PR'."*
+
+A genuine misnomer:
+
+| Word | In GitHub | In HTTP |
+|---|---|---|
+| "PR" | Pull Request — merge someone's branch | **POST** — `POST /jobs` |
+| **Poll** | — | `GET /status?jobId=...` |
+
+> **A poll is a request, not a *pull* request.** Nothing is being pulled or merged — you're *reading state*. PR already means something else, and using it for "poll" makes conversation harder than it needs to be.
+
+Same instinct as [Lecture 7](lecture-07-request-response.md)'s framing lesson: **name things precisely or you'll reason about them wrongly.** Polling *reads*. It never pulls.
+
+### 5.2 — The Scaling Math
+
+This is the core of the unit. Hussein sets it up:
+
+> *"Imagine you scaled this up. You deployed your backend, you scaled it with H.R. proxy or in Gen X… thousands and thousands of people… each app is making 10 to 20 to 30 to 40 polls."*
+
+Now the arithmetic. Assume **10,000 users**, one job in flight each:
+
+$$\text{polls/second} = \frac{\text{users}}{\text{interval}}$$
+
+| Interval | Polls / second | Per minute | Per day |
+|---|---|---|---|
+| **1 s** | 10,000 | 600,000 | 864 million |
+| **5 s** | **2,000** | 120,000 | 172 million |
+| 10 s | 1,000 | 60,000 | 86 million |
+| 30 s | 333 | 20,000 | 29 million |
+| 60 s | 167 | 10,000 | 14 million |
+
+> **At a 5-second interval, polling one job for 10,000 people means 2,000 requests per second — forever, just to learn whether work finished.**
+
+Note the last column: a single polling feature becomes **172 million requests per day**. One feature. One number.
+
+### 5.3 — The 99% Waste, Computed Precisely
+
+Hussein says *"maybe 99% of them are useless."* Here's the exact figure for his own demo scenario:
+
+```mermaid
+flowchart TB
+    A["4-minute job,<br/>5-second interval"] --> B["48 polls total"]
+    B --> C["47 answer NOT DONE,<br/>exactly 1 answers DONE"]
+    C --> D["97.9% waste"]
+
+    style C fill:#ffcdd2,stroke:#c62828
+    style D fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+The general formula:
+
+$$\text{waste} = 1 - \frac{\text{interval}}{\text{job duration}}$$
+
+| Job duration | Interval | Waste |
+|---|---|---|
+| 4 minutes | 5 s | 97.9% |
+| 4 minutes | 30 s | 87.5% |
+| 30 seconds | 5 s | 83% |
+| 6 hours | 60 s | 99.3% |
+
+> **Waste rises with job duration and falls with interval. Long jobs — exactly polling's target use case — are its worst case.**
+
+That last row is the sting: **the workloads polling is *for* are the workloads where polling wastes most.**
+
+#### The waste isn't just requests — it's information
+
+The sharper observation:
+
+> **A poll that returns "not ready" carries zero new information. The client already knew it wasn't ready — otherwise it wouldn't have polled.**
+
+Forty-seven responses, each confirming what the caller already believed. **The client asked a question whose answer it already had**, at a fixed interval, until the answer changed.
+
+> **That is not communication — that's a timer with network overhead.**
+
+### 5.4 — Where the Bytes Go: Bandwidth Is Money
+
+Those 2,000 requests/second have weight. Estimate ~600 bytes per poll round-trip (request line, headers, response headers, TCP/IP overhead — the body is a few bytes):
+
+$$2{,}000 \times 600 = 1.2 \ \text{MB/s} \;\Rightarrow\; \approx 100\ \text{GB/day} \;\Rightarrow\; \approx 3\ \text{TB/month}$$
+
+The payload efficiency is brutal. Of those ~600 bytes, maybe 10 carry information:
+
+| | Bytes | Share |
+|---|---|---|
+| TCP/IP + TLS headers | ~110 | ~18% |
+| HTTP request line + headers | ~300 | ~50% |
+| HTTP response headers | ~180 | ~30% |
+| **Actual payload** (`{"done":false}`) | **~10** | **~2%** |
+
+> **~98% of every poll is protocol tax.** And that mirrors the 98% request waste — two independent 98%s.
+
+Now Hussein's point, which is why this matters beyond technical curiosity:
+
+> *"If we learned anything, the network bandwidth, especially on the back end, is really precious. Because if you put everything in the cloud, that's how you get billed, right? So your backend architecture can make or break your backend application."*
+
+**This is a cost argument, not a performance argument.** At 100 GB/day you're paying for 98% of that egress to deliver nothing. And it's *egress* — usually the more expensive direction.
+
+### 5.5 — The Server's Time, with an Honest Nuance
+
+> *"When a backend receives a poll, it has to do a check. And that check takes a finite amount of time. This resource could have been spent serving actual requests and doing useful things."*
+
+Right — but be precise, because a single status lookup is genuinely cheap. One poll costs roughly:
+
+1. Connection setup (or reuse — see below)
+2. TLS termination
+3. HTTP parsing, **auth check**, routing
+4. A store lookup — memory or Redis, microseconds
+5. Response serialization
+
+**Individually trivial. Collectively the story changes** — and the sharpest version of Hussein's point is one he doesn't make:
+
+```mermaid
+flowchart TB
+    A["2,000 polls/second<br/>of protocol tax"] --> B["your load balancer<br/>does 2,000 rps of work"]
+    B --> C["your autoscaler sees<br/>rising request count"]
+    C --> D["and scales your fleet<br/>for the polling traffic"]
+    D --> E["you now pay for N servers<br/>to serve emptiness<br/>plus the real traffic"]
+    E --> F["2,000 rps of real work<br/>diluted across<br/>a fleet sized by polls"]
+
+    style D fill:#ffcdd2,stroke:#c62828
+    style F fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+> **You scale your infrastructure to serve the absence of information.** Autoscaling counts requests, not useful requests.
+
+**A production detail that makes it much worse:** if your client doesn't reuse connections, every poll pays a **full TCP + TLS handshake** — roughly 1–2 KB and an extra round trip. Polling without keep-alive is catastrophic; with keep-alive it's merely expensive.
+
+### 5.6 — You Cannot Tune Your Way Out
+
+Hussein's honest note:
+
+> *"You can play with the configuration. You can minimize the poll, but that's the problem — too chatty."*
+
+The interval is the only dial, and it controls two things that fight each other:
+
+```mermaid
+flowchart TB
+    A["SHORT interval,<br/>1 second"] --> B["low latency,<br/>you learn quickly"]
+    A --> C["but 10x the requests,<br/>10x the bandwidth,<br/>a fleet sized for polls"]
+
+    D["LONG interval,<br/>60 seconds"] --> E["cheap, calm,<br/>small fleet"]
+    D --> F["but up to 60 seconds<br/>of darkness after<br/>every completion"]
+
+    B --> G["no setting fixes this.<br/>It is a trade,<br/>not a bug."]
+    F --> G
+
+    style C fill:#ffcdd2,stroke:#c62828
+    style F fill:#ffcdd2,stroke:#c62828
+    style G fill:#fff9c4,stroke:#fbc02d
+```
+
+Worse, **the two costs have different shapes:**
+
+| Cost | Behaviour as interval shrinks |
+|---|---|
+| **Bandwidth, fleet size, money** | Grows **linearly** — smooth, predictable |
+| **User-perceived staleness** | Bounded by interval, but the *worst case* is what users feel |
+
+So you're trading a cost you can measure precisely against a latency users feel. That's why polling intervals get argued about forever.
+
+### 5.7 — The Ledger
+
+| | |
+|---|---|
+| ✅ **Gained (Unit 4)** | Simplicity, compatibility, safe resume, long-work fit, zero idle cost |
+| 💸 **Paid (this unit)** | 2,000 rps to learn one bit · ~98% waste · ~100 GB/day · a fleet sized for emptiness |
+| ⏱️ **Inherited** | Latency floor = the interval (Unit 2.4) |
+
+> **The irony: polling wastes the most on exactly the long-running jobs it was built to serve.** Long duration maximizes the ratio of empty polls to useful ones.
+
+**Which is why the next lecture is Long Polling.** Its entire purpose is to delete the empty polls — keep the request open until there's actually something to say. Same client idea, one change that removes the waste:
+
+> **Short polling asks and gets told "no." Long polling waits until it can answer "yes."**
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -418,6 +769,14 @@ And this is where polling starts revealing its seams. Unit 5 shows the cost of t
 | **State** | A stored fact that any client can read, as often as it likes |
 | **Idempotent read** | Reading the same result repeatedly with no side effects |
 | **TTL** | Time-to-live — how long a finished result stays readable |
+| **Resume loop** | On restart, read persisted pending jobs and re-poll each |
+| **Pending list** | The client's local record of jobs it hasn't yet received results for |
+| **Reconciliation** | Matching local state against server state on startup |
+| **Protocol tax** | The share of bytes and CPU spent on framing rather than information |
+| **Waste ratio** | `1 − interval / job duration` — the fraction of polls that answer "no" |
+| **Egress** | Traffic leaving your infrastructure — usually the expensive direction |
+| **Keep-alive** | Reusing one TCP/TLS connection across many polls |
+| **Autoscaling** | Adding servers based on measured load — including useless load |
 
 ---
 
@@ -448,6 +807,28 @@ And this is where polling starts revealing its seams. Unit 5 shows the cost of t
 6. Name one failure that **only** polling survives, and one failure that **only** polling creates.
 7. You set the result TTL to 60 seconds. Describe a user who is now worse off than they were under vanilla request/response.
 
+### Unit 4
+
+1. Name the three things you must build for a polling system. Now compare to what SSE needs.
+2. Why does polling survive proxies and firewalls that break SSE? What property does it have that a special protocol doesn't?
+3. Walk the resume loop in 4.2 in three moves. What is the one thing that must be persisted, and where?
+4. **Which earlier unit's policy gates this unit's advantage?** Say which one and why.
+5. A 50ms request and a 6-hour job. Which mechanism fits each? What does your answer say about choosing by *duration* rather than novelty?
+6. Give one concrete case from 4.4 where polling's statelessness beats push — and name the cost you'd pay for it.
+7. Two clients poll the same job ID. Is that allowed by the design? What does it suggest about where polling is heading?
+
+### Unit 5
+
+1. Correct the misnomer in 5.1. What does a poll actually *do*, and what does `PR` mean in HTTP?
+2. 10,000 users, 5-second interval. How many polls per second? Per day? Show the arithmetic.
+3. A 4-minute job polled every 5 seconds. What percentage of polls is waste? What single formula gives this for any job?
+4. **Why is the waste figure also an information figure?** What does the client already know before it polls?
+5. Why does a *longer* job make polling worse, when long jobs are polling's target use case?
+6. Roughly what fraction of each poll's bytes is actual payload? Why does Hussein say bandwidth is "precious"?
+7. **Name something Hussein didn't say that autoscaling does to this picture.**
+8. Two clients poll every 1 second and every 60 seconds. Describe the trade each has made.
+9. If polling's biggest cost is the empty polls, what single change would remove most of it? Hold that thought — Lecture 11.
+
 ---
 
 ## Open Questions
@@ -469,6 +850,21 @@ Logged as we go. ❓ = unverified, first pass.
 | 4 | ❓ The demo stores jobs in an in-memory dictionary. Does that survive a restart? What happens to a client mid-job? | Unit 6 |
 | 5 | ❓ Is long polling really "used by Kafka," or is Kafka's model log-based pub/sub with a different reason for long fetches? | Unit 7 |
 
+### Unit 5 — gaps the numbers opened up
+
+| # | Question |
+|---|---|
+| 6 | ❓ Every figure in Unit 5 is an **estimate** built on assumptions: 10,000 users, one job each, 5-second interval, ~600 bytes per poll. Are those reasonable? What changes if a user holds **3 jobs** — realistic for a dashboard? |
+| 7 | ❓ Is **1 second → 10,000 rps** actually survivable? Where does the breaking point sit, and is it the network, the server, or the load balancer? |
+| 8 | ❓ Unit 5.5 argues you scale your fleet for empty polls. But is that actually true of **connection-based** load — since keep-alive means each open connection is cheap to hold? Re-examine the autoscaling claim. |
+| 9 | ❓ Does the `waste = 1 − interval/duration` formula hold when a job **finishes early**? Polls after completion return the result — is that waste or useful redundancy? |
+
+### Cross-unit tension worth resolving
+
+| # | Question |
+|---|---|
+| 10 | ❓ Units 4.3 and 5.3 **directly contradict each other**: long jobs are polling's best fit *and* its worst waste ratio. Which wins in practice — and how should that shape when you reach for polling at all? |
+
 ---
 
-*Units 1–3 of 7 studied together. Units 4–7 awaiting delivery.*
+*Units 1–5 of 7 studied together. Units 6–7 awaiting delivery.*
