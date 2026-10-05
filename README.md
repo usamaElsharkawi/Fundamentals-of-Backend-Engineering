@@ -15,7 +15,7 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 - **In progress:**
   - **Lecture 9 — Synchronous vs Asynchronous Workloads** ⏸️ paused
     - Units 1–7 studied ✅ | Units 8–10 explained only 📋 (revisit pending — 12 open questions logged)
-  - **Lecture 11 — Long Polling** 🔄 current — Units 1–2 of 7 studied (mechanism + payoff)
+  - **Lecture 11 — Long Polling** 🔄 current — Units 1–3 of 7 studied (mechanism, payoff, cost)
 - **Remaining:** 7 lectures
 - **Lectures:**
   1. ✅ [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
@@ -23,7 +23,7 @@ This repository documents the journey through the "Fundamentals of Backend Engin
   3. ✅ [8. Push](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-08-push.md) (20min)
   4. [9. Synchronous vs Asynchronous workloads](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) (43min)
   5. ✅ [10. Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) (14min)
-  6. 🔄 [11. Long Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) (10min) — Units 1–2 of 7 studied
+  6. 🔄 [11. Long Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) (10min) — Units 1–3 of 7 studied
   7. [12. Server Sent Events](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-12-sse.md) (13min)
   8. [13. Publish Subscribe (Pub/Sub)](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-13-pubsub.md) (17min)
   9. [14. Multiplexing vs Demultiplexing](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-14-multiplexing.md) (15min)
