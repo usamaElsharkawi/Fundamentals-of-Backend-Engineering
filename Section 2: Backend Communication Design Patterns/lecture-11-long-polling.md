@@ -1,15 +1,15 @@
 # Lecture 11: Long Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–3 studied · Units 4–7 not yet delivered)
+## Status: In Progress 🔄 (Units 1–4 studied · Units 5–7 not yet delivered)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–3** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **4–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–4** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
+> | **5–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
 >
-> **Unit 1 is the mechanism, Unit 2 the payoff, Unit 3 the bill — and the bill contains this lecture's thesis.** Long polling is only safe when the server stores results durably. Unit 4 shows that's exactly why Kafka chose it.
+> **Unit 1 is the mechanism, Unit 2 the payoff, Unit 3 the bill, Unit 4 the reason anyone uses it.** Units 2 and 3 are a matched pair; Unit 4 answers the question Unit 3 left hanging. Read them in order or the argument doesn't land.
 >
 > **Unit 3 tests a prediction.** [Lecture 10](lecture-10-polling.md) Unit 7.4 predicted that long polling relocates short polling's cost rather than removing it. Hussein appears to confirm this. Unit 3 will press it.
 >
@@ -26,7 +26,7 @@
 | **1** | **The trick** — same request, the server just doesn't reply | ✅ Studied |
 | **2** | **Why it works** — the empty response is deleted | ✅ Studied |
 | **3** | **The cost** — polling moved server-side, and disconnect is not a pro | ✅ Studied |
-| 4 | Why Kafka chose it — backpressure, not the trick | ⬜ |
+| **4** | **Why Kafka chose it** — backpressure, not the trick | ✅ Studied |
 | 5 | The remaining gap — it is still not real time | ⬜ |
 | 6 | The demo — the event-loop trap in the `while` loop | ⬜ |
 | 7 | Recap — and the road to SSE | ⬜ |
@@ -36,7 +36,7 @@
 | # | Claim from the transcript | Why it needs testing | Status |
 |---|---|---|---|
 | 1 | ✅ **ANSWERED in Unit 3.3** — true against a long-held request, **false against short polling**. Long polling turns Unit 10's *state* back into a *delivery*, so a disconnect can destroy the result | Closed |
-| 2 | "Long polling is used by Kafka" | [Lecture 10](lecture-10-polling.md) Unit 7.3 said this is true but beside the point. This transcript gives the *real* reason — **backpressure** — which is neither efficiency nor trickery | ⏳ Unit 4 |
+| 2 | ✅ **ANSWERED in Unit 4** — neither efficiency nor trickery. **Backpressure**: push makes a slow consumer the broker's emergency; pull makes it a non-event. The log then makes long polling *safe* | Closed |
 | 3 | *"I wouldn't say simple, to be honest. There's more nuance here"* | The demo contains a `while` loop that **kills the Node event loop**. Is that a transcription slip, or is long polling in Node genuinely this hard? | ⏳ Unit 6 |
 
 ### And one prediction from Lecture 10 to verify
@@ -561,6 +561,158 @@ That is why [Lecture 10](lecture-10-polling.md) Unit 7.3 said the offset log is 
 
 ---
 
+## Unit 4 — Why Kafka Actually Chose It
+
+Unit 3 closed the transcript's "long polling is used by Kafka" claim by saying it was *beside the point*. This unit gives the real reason — and it turns out to be the better answer.
+
+### 4.1 — The Reason He Gives
+
+> *"They did not like the push model because… you have a consumer and you connect it to a topic, and every time the topic has data, it pushes the data to the clients' throats, literally. The consumer sometimes cannot handle the volume of messages."*
+>
+> *"Hey — let the client pull at their leisure."*
+
+That is the whole idea in six words. But *why* can't the consumer handle the volume? Because **nobody consulted it about the rate.**
+
+### 4.2 — Backpressure: Who Sets the Rate?
+
+The volume problem isn't a Kafka detail. It's the fundamental difference between push and pull at the data layer:
+
+```mermaid
+flowchart TB
+    subgraph PUSH["PUSH - producer sets the rate"]
+        P1["producer: 10,000 msg/sec"] --> P2["consumer:<br/>can only handle 100"] --> P3["900 msg/sec<br/>must be buffered SOMEWHERE"]
+        P3 --> P4["broker memory grows<br/>until it OOMs, or<br/>messages get dropped"]
+    end
+
+    subgraph PULL["LONG POLLING - consumer sets the rate"]
+        Q1["producer: 10,000 msg/sec"] --> Q2["appended to the LOG"] --> Q3["consumer pulls at<br/>100/sec, its own pace"]
+        Q2 --> Q4["log simply grows.<br/>Bounded by retention.<br/>No pressure on anyone."]
+    end
+
+    style P4 fill:#c62828,stroke:#c62828,color:#ffffff
+    style Q4 fill:#388e3c,stroke:#388e3c,color:#ffffff
+```
+
+| | Push | Pull |
+|---|---|---|
+| Rate is set by | **Producer** | **Consumer** |
+| Consumer is slow → | Broker buffers, then OOMs or drops | **Nothing. It waits.** |
+| Who is the throttle? | The producer — unintentionally | **The consumer — deliberately** |
+| Failure mode is visible as | Memory pressure, dropped messages | Log length |
+
+> **Backpressure is a flow-control mechanism where the consumer's processing speed limits the producer's sending speed.** Pull doesn't *manage* backpressure — it makes violating it structurally impossible.
+
+**The elegant consequence:** under push, a slow consumer is the broker's emergency. Under pull, a slow consumer is a non-event.
+
+### 4.3 — Why This Is Worse for Kafka Than for Ordinary Push
+
+[Lecture 8](lecture-08-push.md) taught that push's problems are your problems. Kafka makes three of them fatal:
+
+**1. Volume is unbounded and unpredictable.** A topic can receive a traffic spike no consumer can absorb. Push requires the broker to buffer the difference — and its memory is finite.
+
+**2. Push makes the broker stateful.** To push, the broker must track every consumer's position, decide routing, and handle in-flight messages per consumer. **Pull makes the consumer stateful instead** — the consumer holds an offset. Kafka moved that bookkeeping off the broker deliberately.
+
+**3. Redelivery becomes trivial under pull.** Push: a consumer dies holding 500 in-flight messages — what happens to them? A distributed problem. Pull: restart from the **last committed offset** and re-read. At-least-once, trivially.
+
+**4. Replay is free.** A new consumer joins, or you want last Tuesday's data for debugging — reset the offset and read again. Push cannot replay anything it already delivered.
+
+> **Push is fine when consumer speed is predictable and roughly matched to producer speed. Kafka's whole premise is that it isn't.**
+
+### 4.4 — The Log Repairs Unit 3's Regression
+
+Now the payoff. Unit 3.3 concluded:
+
+> *Long polling converts state back into delivery — so a disconnect can destroy the result.*
+
+True in isolation. But Unit 3 also flagged ❓ question 8:
+
+> *If the result must be stored durably anyway, isn't the honest design just SSE?*
+
+Unit 4 answers it. Look at what the log does to the exact failure Unit 3.3 found:
+
+```mermaid
+flowchart LR
+    A["UNIT 3's finding:<br/>long polling turns<br/>state into DELIVERY"] --> B["the LOG turns<br/>it back into STATE"]
+    B --> C["disconnect?<br/>re-read from<br/>last offset"]
+    B --> D["slow consumer?<br/>catch up when able"]
+    B --> E["missed three events?<br/>all three are<br/>still in the log"]
+
+    style A fill:#ffcdd2,stroke:#c62828
+    style B fill:#c8e6c9,stroke:#388e3c
+```
+
+| Unit 3.3's failure | With a log |
+|---|---|
+| Disconnect after response written | **Nothing lost** — re-read from last offset |
+| Client can't tell what it missed | **It knows exactly** — offsets are sequential |
+| Slow client forces a decision | **It just takes longer** to catch up |
+
+**So long polling alone is unsafe, and the log is precisely what makes it safe.** The two aren't adjacent features — the log is the other half of the design.
+
+### 4.5 — The Log vs. a Queue
+
+This is where the parked [broker doc](message-brokers-rabbitmq-vs-kafka.md) earns its place. The difference is small in code and enormous in consequences:
+
+```mermaid
+flowchart TB
+    subgraph Q["QUEUE - RabbitMQ"]
+        A1["consumer reads msg 5"] --> A2["msg 5 is REMOVED"]
+        A2 --> A3["a new consumer<br/>cannot see it.<br/>replay: IMPOSSIBLE"]
+    end
+
+    subgraph L["LOG - Kafka"]
+        B1["consumer reads offset 5"] --> B2["msg 5 is RETAINED"]
+        B2 --> B3["a new consumer<br/>reads from 0.<br/>replay: RESET THE OFFSET"]
+    end
+
+    style A3 fill:#ffcdd2,stroke:#c62828
+    style B3 fill:#c8e6c9,stroke:#388e3c
+```
+
+| | Queue | Log |
+|---|---|---|
+| After a consumer reads | **Deleted** | **Retained** |
+| Two independent consumers | Each gets a copy, split the work | **Each reads everything** |
+| New consumer joins | Seeks only what's left | **Reads from the beginning** |
+| Replay for debugging | ❌ Impossible | ✅ One config change |
+| Slow consumer | Messages pile up at the broker | **Log grows** — bounded by retention |
+| **Who owns position** | The **broker** | **The consumer** |
+
+> **A queue delivers each message once. A log *keeps* it and lets each reader decide how far to read.** Kafka chose "keeps," and nearly every capability above follows from that one decision.
+
+**And the slow-consumer row explains Unit 3.1's apparently damning cost.** A waiting client's memory grows — so you *worry* about 10,000 held connections. But Kafka's held connection is cheap: an open TCP socket waiting on a read. The load is on the *log*, which is disk, retention-bounded, and cheap. **Kafka moved the pressure off RAM and onto disk.** That's a deliberate trade, not an accident.
+
+### 4.6 — Two Corrections to Our Own Framing
+
+**1. [Lecture 10](lecture-10-polling.md) Unit 7.3 was wrong in emphasis.** We wrote:
+
+> *"Long polling gives you efficiency. Kafka's log gives you replay. **Different problems.**"*
+
+Wrong. They are **one design's two halves**. Long polling without the log is unsafe (Unit 3.3); the log without long polling gives no live notification at all. They're not separable concerns — they're a mechanism and its safety net.
+
+**2. Unit 3 was analysing a component in isolation.** We said "long polling without a durable store is strictly worse than short polling." True *as a standalone design* — but it implicitly assumed long polling was meant to be standalone. It isn't. **Long polling is a wire protocol, not a system design.**
+
+The distinction matters: Unit 3's verdict was correct about the mechanism and wrong about its completeness.
+
+### 4.7 — The Spine of This Unit
+
+> **Pull costs the producer nothing, so the consumer is free to be as slow as it needs to be.** Everything durable in Kafka — replay, at-least-once, independent consumers, debugging — falls out of that one choice.
+
+And the offset deserves its moment, because [Lecture 10](lecture-10-polling.md) Unit 7.7 predicted it:
+
+> **"Kafka offsets — a resumable handle into a log."**
+
+That's exactly what it is, and it's the same primitive as Unit 1's job ID, one level up:
+
+| | Handle | Points into | Resumable? |
+|---|---|---|---|
+| Job ID (L10 Unit 1) | a record | A store | No — binary done/not-done |
+| **Kafka offset** | a position | **An ordered log** | **Yes — read forward from any point** |
+
+Unit 1's handle said *"this thing exists."* Kafka's handle says *"I've read up to here."* The second is strictly more powerful, and it's why Unit 7.7 called the handle the idea worth carrying to every lecture.
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -584,6 +736,12 @@ That is why [Lecture 10](lecture-10-polling.md) Unit 7.3 said the offset log is 
 | **Socket buffer** | Per-connection memory held by the OS/runtime; scales with waiter count |
 | **Re-poll gap** | The interval between a long poll's response and the client's next request |
 | **Sequence of snapshots** | Long polling's real shape — not a stream, one answer per request |
+| **Backpressure** | Consumer processing speed limiting producer send rate |
+| **Throttle** | Whoever sets the rate. Push: the producer. Pull: the consumer |
+| **Offset** | A consumer's position in a log; the resumable handle |
+| **Consumer group** | A set of consumers sharing one partition's read position |
+| **Log vs. queue** | Queues delete on read; logs retain, and each reader picks its own position |
+| **Retention** | How long a log keeps messages — the bound on growth |
 
 ---
 
@@ -619,6 +777,13 @@ That is why [Lecture 10](lecture-10-polling.md) Unit 7.3 said the offset log is 
 17. What does the progress-bar problem have to do with this?
 18. **The rule:** under what single condition is long polling safe?
 19. Using Unit 3.6's causal chain — why did Kafka choose long polling? What would go wrong if it had no log?
+20. Define backpressure in one sentence. Under push, who is the throttle? Under pull?
+21. Producer at 10,000 msg/sec, consumer handling 100/sec. What happens under push? Under pull?
+22. Why is "the log grows" a **feature** under pull and a **bug** under push?
+23. Name three reasons push is wrong for Kafka specifically.
+24. **How does the log repair Unit 3's regression?** Be precise: state, delivery, and what the reconnecting consumer does.
+25. Queue vs. log: what happens to a message after a consumer reads it? What follows from that?
+26. Whose state does pull move to the consumer, and what operational consequence does that have for a broker operator?
 
 ---
 
@@ -643,6 +808,15 @@ Logged as we go. ❓ = unverified, first pass.
 | 9 | ❓ The 160–640 MB figure in 3.1 is an estimate from assumed buffer sizes. What actually dominates per-connection memory in Node.js, and does it change the ceiling materially? |
 | 10 | ❓ Hussein never mentions proxies, but load balancers and CDNs terminate idle connections aggressively. Does that make the *effective* server timeout much shorter than configured — and would it invalidate the request-count formula? |
 
+### Unit 4
+
+| # | Question |
+|---|---|
+| 11 | ❓ Unit 4.3 says push "makes the broker stateful" and pull "makes the consumer stateful." But Kafka's **committed offsets are stored broker-side** in `__consumer_offsets`. Is the claim actually right, or is the state merely *relocated* rather than *eliminated*? |
+| 12 | ❓ Consumer groups were mentioned but not explained. If N consumers share one partition, how do they avoid all reading the same offsets? What does that cost, and does it change Unit 4.2's flow-control story? |
+| 13 | ❓ If a consumer is genuinely slower than real time **forever**, the log grows without bound until retention evicts messages the consumer hasn't read. **That is silent data loss.** How does Kafka handle this, and should it change Unit 4.4's "nothing lost" claim? |
+| 14 | ❓ Unit 4.5 says pull "costs the producer nothing." But a fast producer still pays for **retention storage** for messages nobody reads. Is that cost invisible? |
+
 ### Unit 1
 
 | # | Question |
@@ -653,4 +827,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Units 1–3 of 7 studied together. One of our own claims corrected in Unit 3.4. Units 4–7 awaiting delivery.*
+*Units 1–4 of 7 studied together. Three of our own claims corrected (Units 3.4, 3.5, 4.6). Units 5–7 awaiting delivery.*
