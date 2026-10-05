@@ -1,13 +1,13 @@
 # Lecture 11: Long Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–5 studied · Units 6–7 not yet delivered)
+## Status: In Progress 🔄 (Units 1–6 studied · Unit 7 not yet delivered)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–5** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **6–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–6** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
+> | **7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
 >
 > **Unit 1 is the mechanism, Unit 2 the payoff, Unit 3 the bill, Unit 4 why anyone uses it, Unit 5 what it can't do.** Read them in order — each unit answers the question the previous one raised.
 >
@@ -28,7 +28,7 @@
 | **3** | **The cost** — polling moved server-side, and disconnect is not a pro | ✅ Studied |
 | **4** | **Why Kafka chose it** — backpressure, not the trick | ✅ Studied |
 | **5** | **The remaining gap** — a signal, not data; and where SSE takes over | ✅ Studied |
-| 6 | The demo — the event-loop trap in the `while` loop | ⬜ |
+| **6** | **The demo** — the event-loop trap, and a timeout that makes it worse | ✅ Studied |
 | 7 | Recap — and the road to SSE | ⬜ |
 
 ### Claims flagged for testing
@@ -37,7 +37,7 @@
 |---|---|---|---|
 | 1 | ✅ **ANSWERED in Unit 3.3** — true against a long-held request, **false against short polling**. Long polling turns Unit 10's *state* back into a *delivery*, so a disconnect can destroy the result | Closed |
 | 2 | ✅ **ANSWERED in Unit 4** — neither efficiency nor trickery. **Backpressure**: push makes a slow consumer the broker's emergency; pull makes it a non-event. The log then makes long polling *safe* | Closed |
-| 3 | *"I wouldn't say simple, to be honest. There's more nuance here"* | The demo contains a `while` loop that **kills the Node event loop**. Is that a transcription slip, or is long polling in Node genuinely this hard? | ⏳ Unit 6 |
+| 3 | ✅ **ANSWERED in Units 6.2–6.3** — not a slip. A busy wait starves the very event loop that would advance the job, so the `while` loop **deadlocks**. And `await` inside the loop is short polling in costume | Closed |
 
 ### And one prediction from Lecture 10 to verify
 
@@ -888,6 +888,227 @@ Unit 4.3's conclusion survives in weakened form. What pull avoids is not *state*
 
 ---
 
+## Unit 6 — The Demo
+
+Hussein's own verdict: *"Very simple. I wouldn't say simple, to be honest. There's more nuance here."*
+
+He undercuts his own demo, which is to his credit. This unit answers the ❓ flagged before Unit 1 — and finds the demo is **worse than the thing it replaces.**
+
+### 6.1 — What the Demo Does
+
+Same job store as [Lecture 10](lecture-10-polling.md) Unit 6. One new function:
+
+```javascript
+async function checkJobComplete(jobId) {
+  if (jobs[jobId] >= 100) return true;
+  await new Promise(r => setTimeout(r, 1000)); // ~1s "breathing"
+  return false;
+}
+
+app.get('/checkstatus', async (req, res) => {
+  const done = await checkJobComplete(req.query.jobId);
+  res.send(`job:${req.query.jobId} complete: ${done}`);
+});
+```
+
+The run:
+
+```
+$ curl -X POST localhost:8080/submit
+job:1759650000000
+
+$ curl "localhost:8080/checkstatus?jobId=1759650000000"
+ ... we didn't get a response. We're just waiting here.
+
+# meanwhile, the server console:
+50%  60%  70%  80%
+
+# a few seconds later:
+job:1759650000000 complete: true
+```
+
+> *"So every 3 seconds we get a job complete. That's how you do long polling."*
+
+The request now blocks until the job finishes. That's the mechanism.
+
+### 6.2 — The `setTimeout` Is Load-Bearing
+
+Hussein explains it:
+
+> *"It waits for 1000 milliseconds. And the reason why is because if you don't wait, then the event main loop will be blocked… adding that extra second breathing gave it some time to breathe."*
+
+**That one line is the whole lesson**, and it isn't cosmetic — it's the only thing keeping the process alive:
+
+```mermaid
+flowchart TB
+    A["a SYNCHRONOUS loop<br/>spinning on job progress"] --> B["the event loop never turns"]
+    B --> C["the timer that advances<br/>the job never fires"]
+    C --> D["the job never completes.<br/>The loop waits forever."]
+    D --> E["DEADLOCK.<br/>The loop waits for work<br/>that only it could unblock."]
+
+    F["the await and the setTimeout<br/>give the event loop<br/>a chance to turn"] --> G["the timer fires,<br/>progress advances,<br/>the condition can<br/>become true"]
+
+    style E fill:#c62828,stroke:#c62828,color:#ffffff
+    style G fill:#388e3c,stroke:#388e3c,color:#ffffff
+```
+
+Name the cycle precisely: **the loop waits for the job; the job needs the event loop; the event loop is waiting for the loop to finish.** Each waits on the other. That's a genuine deadlock, not slowness.
+
+### Why this matters more than it looks
+
+> **Node.js cannot implement a long poll with a busy wait, because a busy wait starves the very loop that would do the work.**
+
+So the `await` isn't style. It's the mechanism. Which is [Lecture 9](lecture-09-sync-vs-async.md) Unit 2.5's distinction arriving as a hard constraint:
+
+| | Thread | This function |
+|---|---|---|
+| **Blocked** (busy wait) | ❌ Starved | ❌ Deadlock |
+| **Awaiting** (`await` / `setTimeout`) | ✅ Freed | ✅ Paused, work proceeds |
+
+**Long polling in Node is only possible in the awaiting state.** The "extra second of breathing" is the whole price of admission.
+
+### 6.3 — The `while` Loop Is a Dead End in Both Directions
+
+Hussein warns against it:
+
+> *"You do a while loop… Just keep looping if you do this right. Which is a bad idea. The Node.js will just sit there and run… It will never finish."*
+
+But fixing the deadlock doesn't save it, because there are only two ways to write it:
+
+```mermaid
+flowchart TB
+    Q["why not just loop<br/>until the job is done?"]
+    Q -->|"write it synchronously"| A["event loop starves,<br/>DEADLOCK"]
+    Q -->|"await inside the loop"| B["it runs, but it is<br/>SHORT POLLING<br/>with a wasted held connection"]
+    A --> C["either way,<br/>don't loop"]
+    B --> C
+
+    style A fill:#ffcdd2,stroke:#c62828
+    style B fill:#ffcdd2,stroke:#c62828
+    style C fill:#fff9c4,stroke:#fbc02d
+```
+
+The second road is worse because it *looks* like a fix. `while (!done) await check()` **does** work — and it's exactly short polling, except each iteration also holds a connection open while doing nothing useful.
+
+> **A client-side `while` loop around a long poll is short polling wearing a costume.**
+
+That's Unit 3.4's arithmetic reasserting itself: **the timeout still governs, so the client must still re-request.** Long polling isn't something the *client* loops over. It's one request that the *server* holds.
+
+### 6.4 — The Finding: This Demo Is Worse Than Short Polling
+
+Here's the part that isn't in the transcript, and it's the unit's real payload.
+
+The demo's server waits ~3 seconds, then answers. Apply Unit 3.4's formula to a 50-second job — 10 × 5s progress steps, as in [Lecture 10](lecture-10-polling.md) Unit 6:
+
+```mermaid
+flowchart LR
+    A["SHORT POLLING<br/>Lecture 10 demo<br/>5s client interval"] --> A2["50s job =<br/>10 requests"]
+    B["LONG POLLING<br/>this demo<br/>3s server timeout"] --> B2["50s job =<br/>17 requests"]
+    A2 --> C["the upgrade makes<br/>MORE requests,<br/>not fewer"]
+    B2 --> C
+
+    style A2 fill:#fff9c4,stroke:#fbc02d
+    style B2 fill:#ffcdd2,stroke:#c62828
+    style C fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+$$\left\lceil \frac{50}{3} \right\rceil = 17 \qquad\text{vs.}\qquad \frac{50}{5} = 10$$
+
+> **The demo issues about 70% more requests than the short polling it was supposed to improve on** — because the *server* timeout is shorter than the *client* interval it replaced.
+
+**And who chose it?** The server did. That's Unit 3.4's relocation in action: *"the timeout, not the client, is now the polling interval."* The mechanism doesn't choose a good interval — **you** do, and this demo picked a poor one.
+
+#### The steelman — why a 3-second timeout is defensible
+
+The choice deserves a fair defence:
+
+| Benefit of a tight timeout | Why it matters |
+|---|---|
+| **Proxies never kill it** | 3s is far below the 30–60s of any LB or CDN |
+| **Server restarts reclaim fast** | No long-lived obligations to survive |
+| **Dead clients detected quickly** | No zombie connections accumulating |
+| **No fd pressure** | Exactly ❓ question 1 from Unit 1 |
+
+**That's a real trade**: robustness and cheap failure detection, paid for in request count. [Unit 2.5](#25--the-objection-and-why-the-runtime-matters) says Node.js handles long polls cheaply — so in Node specifically, a tight timeout is *defensible* and may genuinely be right.
+
+> **So the finding isn't "3 seconds is wrong." It's "request count is now a server decision, and this demo didn't make that decision consciously."**
+
+### 6.5 — It Inherits Lecture 10's Bugs, and Makes Them Worse
+
+The `jobs{}` dictionary is still in memory. [Lecture 10](lecture-10-polling.md) Unit 6.4 covered this. Long polling **doesn't fix it — it degrades the failure**:
+
+| | Short polling, unknown job | Long polling, unknown job |
+|---|---|---|
+| Server responds | **`200 undefined`** — *you get an error* | **Nothing** — the request hangs |
+| Client learns | Immediately, wrongly | **Nothing at all** |
+| Failure type | **Loud, wrong** | **Silent, hanging** |
+
+```mermaid
+flowchart TB
+    A["client long-polls job<br/>that lives on server A"] --> B["request lands<br/>on server B"]
+    B --> C["server B's jobs{}<br/>has no such job"]
+    C --> D["short polling:<br/>200 undefined<br/>client SEES the problem"]
+    C --> E["long polling:<br/>nothing written<br/>client WAITS, learning nothing"]
+
+    D --> F["fail loudly,<br/>fixable"]
+    E --> G["fail silently<br/>until the timeout"]
+
+    style F fill:#fff9c4,stroke:#fbc02d
+    style G fill:#c62828,stroke:#c62828,color:#ffffff
+```
+
+> **Long polling converts a detectable error into an undetectable hang.** A `200 undefined` is debuggable; a request that never answers is just… normal waiting.
+
+Every remaining [Lecture 10](lecture-10-polling.md) Unit 6 bug carries over too — no TTL, no cancellation, no ownership check, no auth, `Date.now()` IDs — and the ownership and IDOR bugs are the more dangerous now, because a long poll **enables continuous surveillance** of a job ID that short polling made awkward.
+
+### 6.6 — What the Real Implementation Needs
+
+Hussein admits it himself:
+
+> *"I wouldn't say simple, to be honest. There's more nuance here… because this is a contrived example, you might be lucky and you have like some sort of a readiness, some sort of a publish subscribe where you can effectively get a push notification immediately when you get that and then you respond right there."*
+
+He is describing what the mechanism *actually* needs — a **readiness signal** that wakes the waiter the instant the job finishes. That is:
+
+| The demo's approach | The real approach |
+|---|---|
+| **Sleep for 3s, then check** | **Wait on an event that fires** |
+| Polls, just server-side | **Zero polls** |
+| Request rate = `1 / timeout` | **Request rate = 1** |
+| Detects completion within the timeout | Detects completion **immediately** |
+
+```mermaid
+flowchart LR
+    A["DEMO - timeout-based"] --> A1["sleep 3s,<br/>check, answer"]
+    A1 --> A2["~17 requests<br/>for a 50s job"]
+
+    B["REAL - readiness-based"] --> B1["await a signal<br/>that the job finished"]
+    B1 --> B2["1 request<br/>for a 50s job"]
+
+    style A2 fill:#ffcdd2,stroke:#c62828
+    style B2 fill:#c8e6c9,stroke:#388e3c
+```
+
+> **A readiness signal is what makes long polling a single request instead of a series.** The demo substituted a sleep for the signal — which is why it needs so many.
+
+And what mechanism carries that signal? **Publish/Subscribe.** In-process it's an `EventEmitter`; across a fleet it's Redis pub/sub, Kafka, or any broker.
+
+> **So Lecture 11 ends where Lecture 13 begins.** The correct long poll is pub/sub held for exactly one request's lifetime.
+
+### 6.7 — The Verdict
+
+| | |
+|---|---|
+| ✅ **Proves** | The mechanism works and is small — one `async` function, one route |
+| ✅ **Proves** | The event loop is the whole difficulty; `await` isn't optional |
+| ⚠️ **Hides** | That a readiness signal — not a timeout — is the real design |
+| ⚠️ **Hides** | That request count is now the *server's* choice |
+| 💀 **Gets wrong** | The timeout makes it ~70% *worse* than the short polling it replaces |
+| 💀 **Inherits** | Every [Lecture 10](lecture-10-polling.md) Unit 6 bug, with the failure made silent |
+
+> **The demo is the mechanism in ten lines. It is not the pattern.** The difference between them is a readiness signal — which is the subject of [Lecture 13](lecture-13-pubsub.md).
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -924,6 +1145,12 @@ Unit 4.3's conclusion survives in weakened form. What pull avoids is not *state*
 | **Client-side agency** | The client choosing *when* to look — long polling's unique offer |
 | **Two axes** | Who initiates (Axis 1), how long a connection is held (Axis 2) |
 | **In-flight delivery state** | Which message is currently on the wire — what pull avoids tracking |
+| **Deadlock** | The loop waits for the job; the job waits for the loop to yield |
+| **Busy wait** | Spinning synchronously until something changes — fatal on an event loop |
+| **Readiness signal** | An event that fires when the job finishes — what a real long poll waits on |
+| **Timeout-based polling** | Substituting a sleep for a readiness signal; costs `duration / timeout` |
+| **Silent hang** | A long poll on a missing job fails invisibly, where short polling fails loudly |
+| **Surveillance** | What a held long poll enables: repeated observation of one job ID |
 
 ---
 
@@ -975,6 +1202,16 @@ Unit 4.3's conclusion survives in weakened form. What pull avoids is not *state*
 33. **Lecture 10 Unit 7.5 used one axis. Why is two axes more accurate?**
 34. Which two of the four mechanisms share a cell on Axis 1 — and what does that tell you about their relationship?
 35. Give one example where the re-poll gap is irrelevant, and one where it's fatal. **What question decides which column you're in?**
+36. Reconstruct `checkJobComplete` in words. Why does it need the `setTimeout`?
+37. What exactly deadlocks in a synchronous `while` loop? Name the three-party cycle.
+38. A synchronous loop deadlocks. An `await` inside one works. **Why is the second one still wrong?**
+39. Request counts for a 50-second job: short polling at 5s vs. this demo's long poll at 3s. Which is worse, and by how much?
+40. **Whose choice now determines the request rate?** What does Unit 3.4's formula say?
+41. Give the steelman for a 3-second timeout. Is it defensible?
+42. The demo inherits the in-memory `jobs{}` bug. How does long polling make that failure **worse** than short polling?
+43. What is the *readiness signal* he admits the real implementation needs — and which mechanism carries it?
+44. Which Lecture 9 unit is this demo's `await` load-bearing for?
+45. In one sentence: what does this demo teach, and what does it hide?
 
 ---
 
@@ -1017,6 +1254,15 @@ Logged as we go. ❓ = unverified, first pass.
 | 17 | ❓ Unit 5.4 claims long polling needs "no infrastructure support" and SSE needs "significant" support. Is that fair in 2026? Modern proxies and CDNs handle SSE routinely. Has the gap closed enough to flip the default recommendation? |
 | 18 | ❓ The re-poll gap is described as client RTT. But on a **battery-saving mobile browser**, timers are throttled to once a minute or worse. Does that quietly make long polling useless on mobile, independent of any server-side concern? |
 
+### Unit 6
+
+| # | Question |
+|---|---|
+| 19 | ❓ Unit 6.4 claims the demo issues ~17 requests where short polling issued 10. That assumes the client re-requests on every `false`. Does the demo actually show that, or does it use a *single* request that only ends on `true`? **Which is it?** The transcript says *"every 3 seconds we get a job complete,"* which is ambiguous. |
+| 20 | ❓ Unit 6.4's steelman says a 3-second timeout is defensible because proxies won't kill it. But ❓ question 10 (Unit 3) asked whether proxy timeouts invalidate the request-count formula. Does a tight timeout **defuse** that question, or just hide it? |
+| 21 | ❓ If a readiness signal makes long polling a single request, is long polling still meaningfully distinct from SSE? SSE also delivers immediately over one connection. **What does long polling's single request buy that SSE's permanent connection doesn't?** Unit 7 must answer this. |
+| 22 | ❓ Unit 6.5 claims a held long poll enables "surveillance" of a job ID. But short polling allows the same reads at 5s intervals. Is long polling genuinely worse for enumeration, or just more continuous? |
+
 ### Unit 1
 
 | # | Question |
@@ -1027,4 +1273,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Units 1–5 of 7 studied together. Five of our own claims corrected (Units 3.4, 3.5, 4.6, 5.2, 5.7). Units 6–7 awaiting delivery.*
+*Units 1–6 of 7 studied together. Six of our own claims corrected (Units 3.4, 3.5, 4.6, 5.2, 5.7, 6.4). Unit 7 awaiting delivery.*
