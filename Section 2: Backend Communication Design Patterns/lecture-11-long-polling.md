@@ -1,15 +1,16 @@
 # Lecture 11: Long Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–6 studied · Unit 7 not yet delivered)
+## Status: Complete ✅ (Units 1–7 studied)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–6** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+| **1–7** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
 >
-> **Unit 1 is the mechanism, Unit 2 the payoff, Unit 3 the bill, Unit 4 why anyone uses it, Unit 5 what it can't do.** Read them in order — each unit answers the question the previous one raised.
+> **Every claim in this lecture was tested rather than accepted.** Three transcript claims corrected, six of our own claims corrected, one transcript artifact identified. See *Unit 7.6*.
+>
+> **Unit 7 answers ❓ question 21** — the question Unit 6.6 created: if a readiness signal makes long polling a single request, what does it still buy over SSE? The answer is operational, and it's why long polling outlives fancier designs.
 >
 > **Unit 3 tests a prediction.** [Lecture 10](lecture-10-polling.md) Unit 7.4 predicted that long polling relocates short polling's cost rather than removing it. Hussein appears to confirm this. Unit 3 will press it.
 >
@@ -29,7 +30,7 @@
 | **4** | **Why Kafka chose it** — backpressure, not the trick | ✅ Studied |
 | **5** | **The remaining gap** — a signal, not data; and where SSE takes over | ✅ Studied |
 | **6** | **The demo** — the event-loop trap, and a timeout that makes it worse | ✅ Studied |
-| 7 | Recap — and the road to SSE | ⬜ |
+| **7** | **Recap** — the three axes, and what long polling buys over SSE | ✅ Studied |
 
 ### Claims flagged for testing
 
@@ -1109,6 +1110,191 @@ And what mechanism carries that signal? **Publish/Subscribe.** In-process it's a
 
 ---
 
+## Unit 7 — Recap
+
+This unit answers ❓ #21, and the answer turns out to be the most interesting thing in the lecture.
+
+### 7.1 — Seven Units, One Argument
+
+```mermaid
+flowchart TB
+    U1["Unit 1 - THE TRICK<br/>same request,<br/>the server just doesn't reply"]
+    U2["Unit 2 - THE PAYOFF<br/>the empty response<br/>is deleted"]
+    U3["Unit 3 - THE BILL<br/>polling moved server-side;<br/>disconnect is not a pro"]
+    U4["Unit 4 - THE REASON<br/>backpressure, and<br/>the log as safety net"]
+    U5["Unit 5 - THE CEILING<br/>a signal, not data"]
+    U6["Unit 6 - THE DEMO<br/>deadlock, and a timeout<br/>that makes it worse"]
+
+    U1 --> U2 --> U3 --> U4 --> U5 --> U6
+
+    style U1 fill:#e3f2fd,stroke:#1976d2
+    style U3 fill:#ffcdd2,stroke:#c62828
+    style U5 fill:#fff9c4,stroke:#fbc02d
+    style U6 fill:#ffcdd2,stroke:#c62828
+```
+
+### 7.2 — The Spine
+
+> **By making the server wait instead of answering, long polling deletes the empty response — and inherits the fragility of delivery.** It becomes **safe** only when a durable store restores state, and **efficient** only when a readiness signal ends the wait.
+
+Three conditions, each from a different unit, none of them optional:
+
+| | Requirement | From |
+|---|---|---|
+| **Works at all** | A request the server can hold | Unit 1 |
+| **Worth it** | A readiness signal, not a sleep | Unit 6.6 |
+| **Safe** | A durable store the client can re-read | Units 3.3, 4.4 |
+
+### 7.3 — Answering ❓ Question 21: What Does Long Polling Buy Over SSE?
+
+Unit 6.6 created the pressure:
+
+> If a readiness signal makes long polling a **single** request, and SSE also delivers immediately over **one** connection — what's left?
+
+**Architecturally, almost nothing.**
+
+```mermaid
+flowchart TB
+    A["IDEAL long polling:<br/>readiness signal<br/>plus a durable store"] --> B["immediate delivery,<br/>one request per result,<br/>resumable after disconnect"]
+    C["SSE"] --> B
+
+    B --> D["OBSERVABLY EQUIVALENT.<br/>Same latency.<br/>Same one request per result.<br/>Same resumability."]
+    D --> E["So they do not differ in<br/>what the client SEES.<br/>They differ in what BREAKS,<br/>what they REQUIRE,<br/>and what they COST while idle."]
+
+    style D fill:#c8e6c9,stroke:#388e3c
+    style E fill:#fff9c4,stroke:#fbc02d
+```
+
+**What remains is entirely operational.** Three real differences.
+
+#### 1. Connection failure mode — the big one
+
+| | Long polling | SSE |
+|---|---|---|
+| Connection lives | **One wait**, then closes | Indefinitely |
+| When it breaks | It **dies every time it succeeds** | Can stay broken silently |
+| Recovery | **Free** — the next request is fresh | **A protocol**: heartbeat, `Last-Event-ID`, reconnect |
+| Detection | Immediate | TCP keepalive — minutes, or never behind a proxy |
+
+> **A long-polling connection is self-healing because it ends on every result.** A dead SSE connection is indistinguishable from an idle one until you build machinery to tell them apart — and that machinery is most of SSE's complexity.
+
+#### 2. Infrastructure requirements
+
+| | Long polling | SSE |
+|---|---|---|
+| Needs proxy streaming support | ❌ **No** | ✅ Yes |
+| Needs buffering disabled | ❌ No | ✅ Yes |
+| Survives corporate proxies | ✅ **Ordinary HTTP** | ⚠️ Often needs config |
+| Works over HTTP/1.1 | ✅ Yes | ✅ Yes — unusual for a stream |
+
+> **Long polling works anywhere HTTP works.** SSE works only where you've verified streaming. That's [Lecture 10](lecture-10-polling.md) Unit 4.1's safety-net property, and it's the strongest reason long polling outlives fancier designs.
+
+#### 3. Idle cost
+
+| | Long polling | SSE |
+|---|---|---|
+| Cost for a client that isn't looking | **Zero** — no request outstanding | One connection, held |
+| Scales with | **Waiting** clients | **Connected** clients |
+| Many idle users | ✅ Cheap | ❌ Expensive |
+| Few active users | ❌ Repeated handshakes | ✅ Cheapest |
+
+> **Long polling charges for waiting. SSE charges for connecting.** If your users mostly *aren't* looking, long polling is cheaper. If they always are, SSE is.
+
+#### The answer, in one line
+
+> **Long polling and SSE converge on behavior and diverge on failure modes.** Same result delivered; different blast radius when the network, a proxy, or a client goes wrong.
+
+### 7.4 — The Final Map: Three Axes
+
+[Lecture 10](lecture-10-polling.md) Unit 7.5 gave one axis. Unit 5.5 corrected it to two. **Unit 7 adds the third** — the one that decides operational maturity:
+
+| | Axis 1: who initiates | Axis 2: connection held | **Axis 3: connection failure mode** |
+|---|---|---|---|
+| **Short polling** | Client | Never | **Impossible** — connections are transient |
+| **Long polling** | Client | During the wait | **Self-healing** — dies on every result |
+| **SSE** | Server | Always | **Needs a protocol** — heartbeat + resume |
+| **Pub/Sub** | Broker | Never | **Invisible** — no connection to lose |
+
+```mermaid
+flowchart TB
+    subgraph AX3["AXIS 3 - what happens when the connection breaks?"]
+        A["SHORT POLLING<br/>nothing to break:<br/>worst case is one lost poll"] --> B["LONG POLLING<br/>self-healing,<br/>dies on every success"]
+        B --> C["SSE<br/>needs a protocol:<br/>heartbeat, resume token,<br/>Last-Event-ID"]
+        C --> D["PUB/SUB<br/>no connection<br/>exists to break"]
+    end
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#c8e6c9,stroke:#388e3c
+    style C fill:#e1bee7,stroke:#8e24aa
+    style D fill:#f9c4d0,stroke:#c2185b
+```
+
+> **Axis 3 is the maturity ladder.** It explains a real observation: short polling needs no libraries, SSE needs `EventSource` plus resume handling, pub/sub needs a broker. **Complexity follows directly from how much can break.**
+
+That's the honest answer to "which is better." Neither. **Each buys something by accepting something, and Axis 3 tells you what you're accepting.**
+
+### 7.5 — When to Use It
+
+| ✅ Long polling when | ❌ Not when |
+|---|---|
+| You need immediacy but **can't verify streaming support** | You control the infrastructure and want maximum efficiency |
+| Clients are flaky — mobile, VPN, proxies. Re-requests are free | Connections are cheap and most clients are idle |
+| You want **self-healing** connections | You can afford heartbeat + resume machinery |
+| One event per result — a **signal**, not a stream | You need many events per connection → SSE |
+| The client should decide **when to look** | The user must know regardless of attention |
+
+> **Default to long polling when you can't be sure the fancy option will work. Graduate when you know it will.**
+
+That inverts the usual framing. Most advice says "prefer SSE." The operational reality is that **SSE's requirements are invisible until the day a proxy silently buffers your stream** — and long polling has no such day.
+
+### 7.6 — The Audit
+
+**Six corrections to our own claims:**
+
+| # | Unit | What we said | What we corrected |
+|---|---|---|---|
+| 1 | 3.4 | Request count = **1** | `⌈duration / timeout⌉` |
+| 2 | 3.5 | *"only ever as late as the network"* | True per event, not between — staleness is the **re-poll gap** |
+| 3 | 4.6 | Long polling and the log are *"different problems"* | **One design's two halves** |
+| 4 | 5.2 | Long polling is *"wait for one thing"* | **"Wait for something, take everything, then decide"** |
+| 5 | 5.7 | Pull *"makes the consumer stateful"* | State is **split** — authority client-side, storage broker-side |
+| 6 | 6.4 | The demo improves on short polling | It's **~70% worse** in request count |
+
+**Three transcript claims tested:**
+
+| # | Claim | Verdict |
+|---|---|---|
+| 1 | "Clients can disconnect" as a **pro** | ⚠️ True against a long-held request, ❌ **false against short polling** |
+| 2 | "Long polling is used by Kafka" | ⚠️ True, but **backpressure** is the reason, and the log makes it safe |
+| 3 | *"I wouldn't say simple, to be honest"* | ✅ **Honest, and correct** — he knew the demo wasn't production code |
+
+**And one artifact:** *"40 years ago… when I got interested in Kafka."* Kafka arrived ~2008. Long polling is old; learning it from Kafka isn't. Assume a transcript error.
+
+> **Six corrections, three claims tested, one artifact. Zero accepted on faith.**
+
+### 7.7 — Self-Test — Whole Lecture
+
+1. In one sentence: what does the server do differently in long polling?
+2. Is an unanswered request a failed request? What is the server's obligation?
+3. What single thing does long polling delete? Give the waste-to-signal ratio before and after.
+4. What's the **bigger** win — bandwidth or latency? Give the average detection latency for each.
+5. Long polling's cost scales with what? Short polling's?
+6. **Name the hard limit** 10,000 waiting clients will hit.
+7. Run the disconnect test: job finishes at t=237, connection drops at t=237.02.
+8. Give the real request-count formula. Plug in 4 minutes, 30-second timeout.
+9. What does the timeout *reintroduce*?
+10. Define **backpressure**. Who is the throttle under push? Under pull?
+11. Why is a **queue** different from a **log**? Name three things the log gives you.
+12. What must the server have for long polling to be **safe**?
+13. Why does a **busy wait** deadlock the Node event loop? Name the cycle.
+14. Why is `while (!done) await check()` still wrong?
+15. What is a **readiness signal**, and why does the demo lack one?
+16. Name the **three axes**. Which one explains why SSE needs libraries?
+17. What does long polling buy over SSE — and name the three things it costs instead.
+18. **One sentence: the difference between short and long polling, in terms of ownership.**
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -1151,6 +1337,10 @@ And what mechanism carries that signal? **Publish/Subscribe.** In-process it's a
 | **Timeout-based polling** | Substituting a sleep for a readiness signal; costs `duration / timeout` |
 | **Silent hang** | A long poll on a missing job fails invisibly, where short polling fails loudly |
 | **Surveillance** | What a held long poll enables: repeated observation of one job ID |
+| **Axis 3** | What happens when the connection breaks — the maturity ladder |
+| **Self-healing connection** | One that dies on every success, so failure needs no detection |
+| **Failure-mode divergence** | Two mechanisms that behave identically but break differently |
+| **Idempotent re-request** | The cheapest recovery in HTTP — just ask again |
 
 ---
 
@@ -1263,6 +1453,14 @@ Logged as we go. ❓ = unverified, first pass.
 | 21 | ❓ If a readiness signal makes long polling a single request, is long polling still meaningfully distinct from SSE? SSE also delivers immediately over one connection. **What does long polling's single request buy that SSE's permanent connection doesn't?** Unit 7 must answer this. |
 | 22 | ❓ Unit 6.5 claims a held long poll enables "surveillance" of a job ID. But short polling allows the same reads at 5s intervals. Is long polling genuinely worse for enumeration, or just more continuous? |
 
+### Carried forward from this lecture
+
+| # | Question | Status |
+|---|---|---|
+| 23 | ❓ Unit 7.3 concludes long polling and SSE are *operationally* different but behaviourally equivalent. So does that mean SSE is simply the better long polling — worth migrating to once you can verify your infrastructure? **Or is there a case where long polling is genuinely superior long-term?** | Open — discuss |
+| 24 | ❓ Axis 3 claims complexity follows from what can break. But Pub/Sub has *no* connection and yet requires a broker — arguably more infrastructure than SSE. **Does Axis 3 actually predict complexity, or does it only correlate with it?** | Open — test the claim |
+| 25 | ❓ Unit 6.6 concluded the correct long poll is pub/sub held for one request's lifetime. If that's the shape, is [Lecture 13](lecture-13-pubsub.md) then redundant — just the "correct" version of this lecture? | Deferred to Lecture 13 |
+
 ### Unit 1
 
 | # | Question |
@@ -1273,4 +1471,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Units 1–6 of 7 studied together. Six of our own claims corrected (Units 3.4, 3.5, 4.6, 5.2, 5.7, 6.4). Unit 7 awaiting delivery.*
+*All 7 units studied together. Three transcript claims corrected, six of our own claims corrected, one transcript artifact flagged.*
