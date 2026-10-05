@@ -1,15 +1,15 @@
 # Lecture 11: Long Polling — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–4 studied · Units 5–7 not yet delivered)
+## Status: In Progress 🔄 (Units 1–5 studied · Units 6–7 not yet delivered)
 
 > ### 📋 Read this before continuing
 >
 > | Units | State | What that means |
 > |---|---|---|
-> | **1–4** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
-> | **5–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
+> | **1–5** | ✅ **Studied** | Worked through together. Concepts questioned and confirmed. |
+> | **6–7** | ⬜ **Not yet delivered** | Only an outline. Nothing here is written from discussion. |
 >
-> **Unit 1 is the mechanism, Unit 2 the payoff, Unit 3 the bill, Unit 4 the reason anyone uses it.** Units 2 and 3 are a matched pair; Unit 4 answers the question Unit 3 left hanging. Read them in order or the argument doesn't land.
+> **Unit 1 is the mechanism, Unit 2 the payoff, Unit 3 the bill, Unit 4 why anyone uses it, Unit 5 what it can't do.** Read them in order — each unit answers the question the previous one raised.
 >
 > **Unit 3 tests a prediction.** [Lecture 10](lecture-10-polling.md) Unit 7.4 predicted that long polling relocates short polling's cost rather than removing it. Hussein appears to confirm this. Unit 3 will press it.
 >
@@ -27,7 +27,7 @@
 | **2** | **Why it works** — the empty response is deleted | ✅ Studied |
 | **3** | **The cost** — polling moved server-side, and disconnect is not a pro | ✅ Studied |
 | **4** | **Why Kafka chose it** — backpressure, not the trick | ✅ Studied |
-| 5 | The remaining gap — it is still not real time | ⬜ |
+| **5** | **The remaining gap** — a signal, not data; and where SSE takes over | ✅ Studied |
 | 6 | The demo — the event-loop trap in the `while` loop | ⬜ |
 | 7 | Recap — and the road to SSE | ⬜ |
 
@@ -713,6 +713,181 @@ Unit 1's handle said *"this thing exists."* Kafka's handle says *"I've read up t
 
 ---
 
+## Unit 5 — The Remaining Gap
+
+Units 2 and 3 priced long polling. Unit 4 explained why anyone uses it. This unit closes the last conceptual hole: **what long polling fundamentally cannot do**, and where SSE takes over.
+
+[Unit 3.5](#35--it-is-still-not-real-time) introduced the re-poll gap. This unit goes further — into a limitation that gap only describes the symptoms of.
+
+### 5.1 — The Burst Problem: A Signal, Not Data
+
+Unit 3.5 said long polling is "a sequence of snapshots." Here's the sharper consequence, and it's the real ceiling on the mechanism:
+
+```mermaid
+flowchart TB
+    E1["event 1"] --> E2["event 2"] --> E3["event 3"] --> E4["event 4"] --> E5["event 5<br/>all five arrive<br/>during ONE long poll"]
+    E5 --> R["the poll returns<br/>ONE answer"]
+    R --> Q["client learns:<br/>SOMETHING HAPPENED"]
+    Q -.->|"but not how many,<br/>which ones, or whether<br/>more are still coming"| H["the other four wait<br/>for the NEXT poll"]
+
+    style Q fill:#fff9c4,stroke:#fbc02d
+    style H fill:#ffcdd2,stroke:#c62828
+```
+
+> **Long polling is an existential quantifier — "∃ something new?" — not a universal one — "here is everything new."** You get a *signal*, not *data*.
+
+This is not a fixable inefficiency. It's the shape of the mechanism. One request, one answer, **by construction.**
+
+| The client can learn | The client cannot learn |
+|---|---|
+| That *at least one* event occurred | How many |
+| One event's contents | Whether four more are queued |
+| That the wait ended | When the *next* event will arrive |
+
+**Progress reporting died here** — ❓ question 6, answered in Unit 3.5. This is the same wall from the other side.
+
+### 5.2 — How Kafka Works Around It
+
+Kafka's `Fetch` doesn't return a single record. It returns **a batch**, and it adjusts its own waiting based on whether that batch came back full:
+
+```mermaid
+flowchart TB
+    A["consumer has nothing<br/>to read"] --> B["LONG POLL<br/>wait for the first record"]
+    B --> C["records arrive"]
+    C --> D{"was the batch<br/>FULL or short?"}
+    D -->|"full -<br/>backlog exists"| E["fetch AGAIN immediately,<br/>no waiting.<br/>Drain fast."]
+    E --> D
+    D -->|"short -<br/>caught up"| F["long poll again<br/>and wait"]
+
+    style E fill:#c8e6c9,stroke:#388e3c
+    style F fill:#e3f2fd,stroke:#1976d2
+```
+
+**So a Kafka consumer is doing both.** It long-polls when idle, and short-polls hard when there's a backlog.
+
+That corrects a simplification in Units 2 and 3. We treated long polling as "wait for one thing." Kafka treats it as:
+
+> **Wait for *something*, then take *everything*, then decide whether to wait again.**
+
+And that's why Kafka still meets a burst of 5,000 messages well: the first fetch returns a full batch, the loop keeps firing without waiting, and only when a batch comes back *short* has it genuinely caught up.
+
+**The re-poll gap is therefore not a constant — it's conditional.** Under backlog, it's zero. Only when idle does the client wait.
+
+### 5.3 — The Two Gaps, Named
+
+Pulling it together, long polling has **two** distinct gaps, and Unit 3 blurred them:
+
+| Gap | What it is | When it costs you |
+|---|---|---|
+| **The re-poll gap** | Client RTT between receiving an answer and issuing the next request | Always, right after every event |
+| **The burst blindness** | Events during one poll are invisible until the next | Only when events arrive in bursts |
+
+The re-poll gap is the honest price of client-driven design. It's small — milliseconds locally, worse on mobile — but **nonzero**, and it reappears after *every single event*. For a chat app that's a visible stutter; for a nightly report it's irrelevant.
+
+### 5.4 — Answering ❓ Question 8: Long Polling vs. SSE
+
+Unit 3 asked it directly:
+
+> *If the result must be stored durably anyway, isn't the honest design just SSE?*
+
+**No — and the reason is client-side agency.**
+
+| | Long polling | SSE |
+|---|---|---|
+| Who initiates each notification? | **The client** | The server |
+| Connection while idle | **None** — no request outstanding | One per client, permanently |
+| Client decides *when to look* | ✅ **Yes, fully** | ❌ Server decides |
+| Burst handling | Only if the response carries a batch | **Natural — any number** |
+| Proxies / load balancers | ✅ **Nothing special required** | ⚠️ Buffering off, long timeouts, sometimes header stripping |
+| Infrastructure dependency | **None** | **Significant** |
+| Client complexity | A simple loop | `EventSource`, parser, reconnect, `Last-Event-ID` |
+| Per-idle-client server cost | **Zero** | One connection |
+
+**Long polling's unique offer is that the client keeps control of its own attention.** With SSE you're told. With long polling you *ask* — and you can decide that a user who hasn't looked at the tab in ten minutes shouldn't generate traffic.
+
+```mermaid
+flowchart TB
+    Q{"does the client need<br/>to know the MOMENT<br/>something happens?"}
+    Q -->|"yes"| S["SSE<br/>zero gap,<br/>needs infrastructure<br/>support"]
+    Q -->|"no, and the client<br/>should decide when to look"| L["LONG POLLING<br/>client sets the pace,<br/>zero idle cost,<br/>no infra needs"]
+    Q -->|"no, and you cannot<br/>hold a connection"| SP["SHORT POLLING<br/>simplest,<br/>stateless server"]
+
+    style S fill:#e1bee7,stroke:#8e24aa
+    style L fill:#e3f2fd,stroke:#1976d2
+    style SP fill:#fff9c4,stroke:#fbc02d
+```
+
+> **SSE when immediacy matters and you control the infrastructure. Long polling when the client should set the pace, or when you can't trust the path.**
+
+That second branch is quietly the more common one in the wild — far more deployments can hold an HTTP request than can negotiate a long-lived bidirectional stream.
+
+### 5.5 — The Ladder Was One Axis Too Simple
+
+[Lecture 10](lecture-10-polling.md) Unit 7.5 put all four mechanisms on a single axis — *how long is the connection held?* Unit 5 shows that's **two axes**:
+
+```mermaid
+flowchart TB
+    subgraph AX1["AXIS 1 - who initiates each notification?"]
+        A["client polls:<br/>SHORT POLLING,<br/>LONG POLLING"] --> B["server pushes:<br/>SSE"] --> C["broker holds it:<br/>PUB/SUB"]
+    end
+
+    subgraph AX2["AXIS 2 - how long is a connection held?"]
+        D["never:<br/>SHORT POLLING"] --> E["during the wait:<br/>LONG POLLING"] --> F["always:<br/>SSE"] --> G["never:<br/>PUB/SUB"]
+    end
+
+    style A fill:#e3f2fd,stroke:#1976d2
+    style B fill:#e1bee7,stroke:#8e24aa
+    style C fill:#c8e6c9,stroke:#388e3c
+```
+
+| | Axis 1: initiator | Axis 2: connection |
+|---|---|---|
+| **Short polling** | Client | Never |
+| **Long polling** | Client | During the wait |
+| **SSE** | Server | Always |
+| **Pub/Sub** | Broker | Never |
+
+Note that **short polling and long polling share a cell on Axis 1** — both are client-driven. That's exactly why long polling is a *refinement* of short polling rather than a different animal: it improves Axis 2's connection cost and the empty-response rate, **not** Axis 1's client-driven nature.
+
+> **And that's the clean answer to ❓ question 8: SSE moves you across Axis 1. Long polling only moves you along Axis 2.** They aren't competitors on one scale — they differ in kind.
+
+**One footnote on Unit 4.4's "nothing lost":** ❓ question 13 is still open. If a consumer stays behind forever, **retention eventually evicts messages it never read** — silent data loss, which qualifies that claim. Deferred to [Lecture 13](lecture-13-pubsub.md), where retention lives.
+
+### 5.6 — "This Might Not Be a Problem for You"
+
+Hussein is refreshingly honest here:
+
+> *"This might not be a problem for you. And this is where the trade-off comes in."*
+
+**Staleness is only a bug if someone is watching.** That deserves taking seriously, not arguing past:
+
+| The gap is **irrelevant** when | The gap is **fatal** when |
+|---|---|
+| A report that regenerates every few minutes | Chat / collaborative editing |
+| A job the user checks hourly | Live trading or auction bidding |
+| A CI/CD status page nobody watches live | "Did my payment go through?" |
+| Analytics dashboards polling every 30s anyway | A stopwatch |
+| Overnight batch exports | Telemetry with sub-second requirements |
+
+> **Ask what the user is doing while they wait.** If the answer is *"nothing, and they wouldn't know if it were slow,"* long polling is complete.
+
+The most important judgment in this lecture is knowing which column you're in — not minimizing the gap.
+
+### 5.7 — A Correction on Offset Ownership
+
+❓ question 11 was right to doubt Unit 4.3. The precise position:
+
+| | Where it lives |
+|---|---|
+| The **decision** of what to read next | **Client-side** |
+| The **record** of the last committed offset | **Broker-side** (`__consumer_offsets`) |
+
+> **The authority is consumer-side; the storage is broker-side.** The state is *split*, not eliminated.
+
+Unit 4.3's conclusion survives in weakened form. What pull avoids is not *state* — it's **in-flight delivery state**: which message is currently on the wire to which consumer. Push must track that per consumer; pull requires only a position. That's the real difference, and it's smaller than "stateful vs. stateless."
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
@@ -742,6 +917,13 @@ Unit 1's handle said *"this thing exists."* Kafka's handle says *"I've read up t
 | **Consumer group** | A set of consumers sharing one partition's read position |
 | **Log vs. queue** | Queues delete on read; logs retain, and each reader picks its own position |
 | **Retention** | How long a log keeps messages — the bound on growth |
+| **Signal, not data** | One answer per request: you learn *that* something happened, not everything |
+| **Existential quantifier** | "∃ something new?" — the logic long polling implements |
+| **Burst blindness** | Events arriving mid-poll are invisible until the next request |
+| **Full vs. short batch** | How Kafka's consumer knows whether a backlog remains |
+| **Client-side agency** | The client choosing *when* to look — long polling's unique offer |
+| **Two axes** | Who initiates (Axis 1), how long a connection is held (Axis 2) |
+| **In-flight delivery state** | Which message is currently on the wire — what pull avoids tracking |
 
 ---
 
@@ -784,6 +966,15 @@ Unit 1's handle said *"this thing exists."* Kafka's handle says *"I've read up t
 24. **How does the log repair Unit 3's regression?** Be precise: state, delivery, and what the reconnecting consumer does.
 25. Queue vs. log: what happens to a message after a consumer reads it? What follows from that?
 26. Whose state does pull move to the consumer, and what operational consequence does that have for a broker operator?
+27. Five events arrive during one long poll. What does the client learn, and what can it not learn? Name the logical distinction.
+28. Why is progress reporting structurally impossible here?
+29. How does Kafka's fetch loop adapt? What does a *full* batch tell it to do, and a *short* one?
+30. **Two gaps.** Name them. Which one only bites during bursts?
+31. **Answer ❓ question 8.** What does long polling offer that SSE doesn't? Why isn't SSE just strictly better?
+32. Walk the 5.4 decision tree for: (a) a live trading app you fully control, (b) a mobile app behind corporate proxies, (c) a nightly report.
+33. **Lecture 10 Unit 7.5 used one axis. Why is two axes more accurate?**
+34. Which two of the four mechanisms share a cell on Axis 1 — and what does that tell you about their relationship?
+35. Give one example where the re-poll gap is irrelevant, and one where it's fatal. **What question decides which column you're in?**
 
 ---
 
@@ -812,10 +1003,19 @@ Logged as we go. ❓ = unverified, first pass.
 
 | # | Question |
 |---|---|
-| 11 | ❓ Unit 4.3 says push "makes the broker stateful" and pull "makes the consumer stateful." But Kafka's **committed offsets are stored broker-side** in `__consumer_offsets`. Is the claim actually right, or is the state merely *relocated* rather than *eliminated*? |
+| 11 | ✅ **ANSWERED in Unit 5.7** — the state is *split*, not eliminated: authority is client-side, storage is broker-side. Unit 4.3 survives only in weakened form, and the real distinction is **in-flight delivery state** | Closed |
 | 12 | ❓ Consumer groups were mentioned but not explained. If N consumers share one partition, how do they avoid all reading the same offsets? What does that cost, and does it change Unit 4.2's flow-control story? |
 | 13 | ❓ If a consumer is genuinely slower than real time **forever**, the log grows without bound until retention evicts messages the consumer hasn't read. **That is silent data loss.** How does Kafka handle this, and should it change Unit 4.4's "nothing lost" claim? |
 | 14 | ❓ Unit 4.5 says pull "costs the producer nothing." But a fast producer still pays for **retention storage** for messages nobody reads. Is that cost invisible? |
+
+### Unit 5
+
+| # | Question |
+|---|---|
+| 15 | ❓ Unit 5.2 says the re-poll gap "is zero under backlog." True only while the backlog lasts. What happens the instant a burst ends — does the last few events get stranded behind a long poll that then waits 30s for nothing? |
+| 16 | ❓ Unit 5.1 argues the burst blindness is *structural*. But Kafka's batch fetch partially defeats it. Is the ceiling "one answer per request," or "one *batch* per request"? Which phrasing is actually correct? |
+| 17 | ❓ Unit 5.4 claims long polling needs "no infrastructure support" and SSE needs "significant" support. Is that fair in 2026? Modern proxies and CDNs handle SSE routinely. Has the gap closed enough to flip the default recommendation? |
+| 18 | ❓ The re-poll gap is described as client RTT. But on a **battery-saving mobile browser**, timers are throttled to once a minute or worse. Does that quietly make long polling useless on mobile, independent of any server-side concern? |
 
 ### Unit 1
 
@@ -827,4 +1027,4 @@ Logged as we go. ❓ = unverified, first pass.
 
 ---
 
-*Units 1–4 of 7 studied together. Three of our own claims corrected (Units 3.4, 3.5, 4.6). Units 5–7 awaiting delivery.*
+*Units 1–5 of 7 studied together. Five of our own claims corrected (Units 3.4, 3.5, 4.6, 5.2, 5.7). Units 6–7 awaiting delivery.*
