@@ -17,6 +17,64 @@ This repository documents the journey through the "Fundamentals of Backend Engin
     - Units 1–7 studied ✅ | Units 8–10 explained only 📋 (revisit pending — 12 open questions logged)
 - **Next:** Lecture 12 — Server Sent Events (13min)
 - **Remaining:** 6 lectures
+
+---
+
+## 🗂️ Next Session: Section Synthesis
+
+**Both lectures are complete and pushed. Nothing is mid-flight.**
+
+The next session has one job: **recap the whole section, link the lectures into one model, and work the backlog.**
+
+### 1. Link the six lectures into one story
+
+| # | Lecture | The idea it contributes |
+|---|---|---|
+| 6 | Intro | Each pattern answers a **different problem** — categorize, don't compete |
+| 7 | Request/Response | A request is **bytes**, not an object. Framing creates boundaries |
+| 8 | Push | Push breaks *"the client drives"* — and inherits every consequence |
+| 9 | Sync vs Async | **Blocked vs awaiting**: is the *thread* suspended, or just this function? |
+| 10 | Polling | Return a **handle**, not a result. Read **state**, not delivery |
+| 11 | Long Polling | Make the server **wait**. Safe only with a durable store |
+
+### 2. The spine to build toward
+
+> **Return a reference instead of a result** — then buy the result back as cheaply as your infrastructure allows. Every pattern in this section is a different answer to *how the client learns what happened*.
+
+### 3. The unified model we already earned
+
+Two corrections we made to Lecture 10's ladder, plus the third axis found in Lecture 11:
+
+| | Axis 1: who initiates | Axis 2: connection held | Axis 3: failure mode |
+|---|---|---|---|
+| Short polling | Client | Never | Impossible |
+| Long polling | Client | During the wait | Self-healing |
+| SSE | Server | Always | Needs a protocol |
+| Pub/Sub | Broker | Never | Invisible |
+
+### 4. Work the backlog — **42 open ❓ , 10 already closed**
+
+| Source | Open | Notes |
+|---|---|---|
+| [Lecture 9](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) | **12** | Units 8–10 still **explained only** — the biggest single debt |
+| [Lecture 10](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) | **8** | TTL, aliasing, autoscaling, the Unit 4.3/5.3 contradiction |
+| [Lecture 11](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) | **22** | Includes 3 carried-forward questions that **challenge our own conclusions** |
+
+Priority order: **Lecture 9 Units 8–10** → the 3 challenges to our own claims → TTL and retention → the rest.
+
+### 5. The 3 questions that test our own reasoning
+
+These are the most valuable — they question conclusions we asserted, not facts we absorbed:
+
+| # | Question | Where |
+|---|---|---|
+| **A** | Axis 3 claims *complexity follows from what can break*. But Pub/Sub has **no connection** yet needs a broker — more infrastructure than SSE. Does Axis 3 **predict** complexity, or only **correlate**? | L11 #24 |
+| **B** | The in-memory-store demo made short polling's failure **loud**. Under long polling it's **silent**. Does that change our earlier judgment that the demo was "elegant"? | L11 #22 |
+| **C** | Unit 4.3 said long polling is "worse than short polling" without a durable store — then Unit 4.6 admitted it was analysing a component in isolation. **Which verdict stands?** | L11 #7, #21 |
+
+### 6. Then continue
+
+Lecture 12 (SSE, 13min) — already set up as the pattern that **crosses Axis 1** from client to server.
 - **Lectures:**
   1. ✅ [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
   2. ✅ [7. Request Response](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-07-request-response.md) (28min)
