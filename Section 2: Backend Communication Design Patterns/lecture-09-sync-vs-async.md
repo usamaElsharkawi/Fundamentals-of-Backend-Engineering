@@ -1,6 +1,6 @@
 # Lecture 9: Synchronous vs Asynchronous Workloads — Built Up, Unit by Unit
 
-## Status: In Progress 🔄 (Units 1–6 documented)
+## Status: In Progress 🔄 (Units 1–7 documented)
 
 > **How to read this doc:** Each unit builds on the previous one. This lecture is long (43min), so it's split into **10 units**. Don't skip ahead — Unit 4 assumes Unit 2, and Unit 7 assumes everything before it. Each unit ends with a **Checkpoint** — answer it in your own words before moving on.
 
@@ -1466,6 +1466,293 @@ That lens move **is** Unit 7, and it's the most important unit in the lecture.
 
 ---
 
+---
+
+## Unit 7 — Backend Asynchronous Processing: The Flip
+
+This is the payoff unit. It's where the lens moves from your client to your server, and where this lecture finally connects to the message-broker material.
+
+### 7.1 — The Trap You Probably Walked Into
+
+You have a client that doesn't block. You feel good. But look at what actually happens on the server.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server handler
+
+    C->>S: POST /generate-report
+    Note right of C: client is async - it moved on,<br/>can do other work
+    Note right of S: but this handler is now<br/>EXECUTING for 5 minutes
+    Note over C,S: Meanwhile the client still<br/>needs the response before it<br/>can finish its own job
+    Note right of S: Server thinks:<br/>someone is waiting for me.<br/>I have to finish
+```
+
+**Two things are simultaneously true:**
+
+| Claim | Reality |
+|---|---|
+| "My client is asynchronous." | ✅ True — it didn't freeze |
+| "The system is asynchronous." | ❌ **False** — the work is still one long synchronous block |
+
+Hussein's diagnosis:
+
+> *"The client is asynchronous, but the whole thing, the system is synchronous. That's synchronous processing — because the backend still thinks: 'someone is actually waiting for me. I got to finish.'"*
+
+> **A non-blocking client does not make a blocking server. It only hides the blocking from *your* thread.**
+
+### 7.2 — Move the Lens to the Backend
+
+Ignore your client entirely. Look at the server handler:
+
+```javascript
+app.post('/generate-report', async (req, res) => {
+    const data = await queryDatabase();       // 50ms
+    const pdf  = await renderReport(data);    // 4 minutes
+    await sendEmail(pdf);                     // 30s
+    res.json({ status: 'done' });              // ← only now, 5 minutes later
+});
+```
+
+From **this function's** perspective the question is identical to Unit 1's:
+
+> *"Am I doing work while I wait?"*
+
+And the answer is **no.** For 5 minutes this handler is standing still at each `await`, holding:
+- The request open
+- The TCP connection alive
+- Whatever resources your framework allocates per in-flight request
+
+**That's synchronous processing.** The word `async` in the function signature doesn't change what the *work* looks like.
+
+### 7.3 — The Flip
+
+The solution is a single question: **why are you still holding the connection open?**
+
+```mermaid
+flowchart TB
+    Q["The work takes 5 minutes.<br/>Do I hold the connection for 5 minutes?"] --> N
+    Q --> Y
+
+    N["NO - respond NOW<br/>with a job ID.<br/>Do the work later."] --> BG["Background worker<br/>does the 5-minute job"]
+    Y["YES"] --> BAD["Client waits 5 min<br/>Times out at 60s<br/>Retries<br/>Duplicate work"]
+
+    style N fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    style Y fill:#ffcdd2,stroke:#c62828
+    style BAD fill:#ffcdd2,stroke:#c62828
+    style BG fill:#e3f2fd,stroke:#1976d2
+```
+
+**The flipped handler:**
+
+```javascript
+app.post('/generate-report', (req, res) => {
+    const jobId = queue.add({ type: 'generate-report', userId: req.user.id });
+
+    res.status(202).json({
+        job_id: jobId,
+        status: 'queued',
+        poll: `/jobs/${jobId}`
+    });
+    // ⚡ Responds in ~5 milliseconds. Connection closed. Done.
+});
+```
+
+### What just changed
+
+| | Before | After |
+|---|---|---|
+| **Connection held** | 5 minutes | 5 milliseconds |
+| **Client timeout risk** | 🔴 Certain | ✅ None |
+| **Duplicate work on retry** | 🔴 Likely | ✅ Impossible (job already queued) |
+| **Server capacity** | 1 request occupies a slot for 5 min | Slot freed immediately |
+| **Where the work happens** | In the request | In a background worker |
+| **Client can disconnect?** | No — it needs the response | **Yes** — it can even save the job ID |
+
+Hussein's phrasing for the client experience:
+
+> *"Hey, I queued your program. You can even disconnect if you want. I'm good. And here is a job ID."*
+
+### 7.4 — Why a Queue and Not Just a Variable
+
+You might think: "why not just `setTimeout` the work inside the process?"
+
+```javascript
+// 🔴 Looks equivalent. Is not.
+app.post('/report', (req, res) => {
+    setTimeout(() => doFiveMinutesOfWork(), 0);   // ← survives nothing
+    res.json({ ok: true });
+});
+```
+
+The moment you run more than one server instance:
+
+```mermaid
+flowchart LR
+    C1["Client"] --> LB["Load balancer"]
+    LB --> S1["Server A<br/>queues job in memory"]
+    C2["Client"] --> LB
+    LB --> S2["Server B<br/>knows nothing about that job"]
+    S1 -.->|"restart or crash<br/>job is GONE"| LOST["work lost"]
+
+    style S1 fill:#c8e6c9,stroke:#388e3c
+    style S2 fill:#ffcdd2,stroke:#c62828
+    style LOST fill:#ffcdd2,stroke:#c62828
+```
+
+An in-memory `setTimeout` dies with the process. **A queue is durable and shared.** That is the whole reason the queue exists — not performance, **survival**.
+
+This is exactly the broker material from [`message-brokers-rabbitmq-vs-kafka.md`](message-brokers-rabbitmq-vs-kafka.md): the queue is *shared state* that outlives any single process.
+
+### 7.5 — The Insight: It's the Same Pattern as a Local Promise
+
+Here is the connection that makes Unit 7 click. Watch what you just built:
+
+```javascript
+// LOCAL (Unit 5)
+const promise = doFiveMinutesOfWork();
+promise.then(result => use(result));
+
+// BACKEND (Unit 7)
+const jobId = queue.add({ type: 'do-five-minutes-of-work' });
+// ... later ...
+GET /jobs/{jobId}   →  { status: 'done', result }
+```
+
+**Structurally identical.** Both give you a handle *immediately* and let you collect the result later.
+
+And that pattern exists at **three scales**:
+
+```mermaid
+flowchart TB
+    L["SCALE 1 - Local<br/>function returns a Promise or Future<br/>same process, microseconds"]
+    P["SCALE 2 - In-process<br/>queue holds a job ID<br/>async worker drains it<br/>same machine, seconds"]
+    D["SCALE 3 - Distributed<br/>RabbitMQ or Kafka holds the job<br/>any worker on any machine consumes<br/>minutes to hours"]
+
+    L -->|"same idea,<br/>bigger boundary"| P
+    P -->|"same idea,<br/>bigger boundary"| D
+
+    style L fill:#e3f2fd,stroke:#1976d2
+    style P fill:#fff9c4,stroke:#fbc02d
+    style D fill:#c8e6c9,stroke:#388e3c
+```
+
+| | Local promise | Queue + job ID | Broker + job ID |
+|---|---|---|---|
+| **The handle** | Promise object | Job ID string | Message ID |
+| **Where the work happens** | Same thread later | Same machine, different thread | Any machine |
+| **How you get the result** | `.then()` / `await` | Poll, push, or subscribe | Consume the message |
+| **Survives a restart?** | ❌ No | ✅ Yes | ✅ Yes |
+| **Lecture** | Unit 5 | Unit 7 | Lecture 13 |
+
+> **Every backend queue is a promise that outlived the process. That's all a "job" is.**
+
+This is also the answer to Lecture 7's **failure mode #2** (long-running request → timeout → duplicate work). That failure mode doesn't get *fixed* — it gets **restructured** so it cannot occur.
+
+### 7.6 — So How Does the Client Learn the Result Finished?
+
+You now owe the client an answer. "Check back later" needs a mechanism — and **the entire rest of this course section is the menu**:
+
+| Pattern | How the client learns | Lecture |
+|---|---|---|
+| **Polling** | "Any update? … Any update?" | 10 |
+| **Long polling** | "Hold the request until it's done" | 11 |
+| **SSE** | Server streams progress on an HTTP response | 12 |
+| **Pub/Sub** | Subscribe to a topic, get notified when published | 13 |
+| **WebSocket** | Persistent bidirectional channel | 8 |
+
+```mermaid
+flowchart LR
+    W["Worker finishes<br/>the job"] --> Q{"How does<br/>the client find out?"}
+    Q --> P["Polling<br/>client asks repeatedly"]
+    Q --> LP["Long polling<br/>server holds the request"]
+    Q --> SSE["SSE<br/>server streams"]
+    Q --> PS["Pub/Sub<br/>subscribe to a topic"]
+    Q --> WSK["WebSocket<br/>push on open socket"]
+
+    style Q fill:#fff9c4,stroke:#fbc02d
+```
+
+> **Asynchronous processing is not a complete design until you pick one of these.** "It's in a queue" is only half a design. The other half is delivery of the result.
+
+### 7.7 — You Have Not Escaped Request/Response
+
+A subtlety worth being precise about, because it sounds like a contradiction:
+
+> *"Technically, the request to check if this job is done is a request response. Also, the first call is also a request response. So we just did a request response — we just split them. Sometimes we're going to merge them, sometimes we're going to split them."*
+
+**Two short request/response exchanges instead of one long one:**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant Q as Queue
+    participant W as Worker
+
+    Note over C,S: Exchange 1 - submit in 5ms
+    C->>S: POST /reports
+    S->>Q: enqueue job
+    S-->>C: 202 Accepted plus job_id
+    Note over C: Client is now FREE.<br/>Can disconnect, save job_id,<br/>do other work
+
+    Note over Q,W: Meanwhile - 5 minutes, nobody is connected
+    W->>Q: consume job
+    W->>W: do the 5-minute work
+    W->>Q: mark complete and store result
+
+    Note over C,S: Exchange 2 - collect in 5ms
+    C->>S: GET /reports/{job_id}
+    S-->>C: status done with result
+```
+
+**What changed:**
+
+| | One long exchange | Two short exchanges |
+|---|---|---|
+| Time a connection is held | 5 minutes | 10 milliseconds total |
+| Client can disconnect | ❌ No | ✅ Yes |
+| Retry duplicates work | 🔴 Yes | ✅ No |
+| Request/response used? | Yes | **Still yes — twice** |
+
+> **Async processing didn't replace Request/Response. It *split* one long Request/Response into two short ones, with a queue in the gap.**
+
+The gap is the whole trick. That is where the durability lives, and that is why the client can leave.
+
+### 7.8 — The Honest Trade
+
+Nothing is free. Here is what you now own:
+
+| You gain | You pay |
+|---|---|
+| Connections freed immediately | **You must poll or subscribe** (Section 2's rest) |
+| Horizontal scaling of long work | **Queue infrastructure** to operate |
+| No client timeouts | **No built-in failure feedback** — client must check |
+| Survives restarts | **Job state is now a real data model** to design |
+| Client can disconnect | **Harder to debug** — no single request to trace |
+| Retry-safe | **Idempotency** — what if the same job is enqueued twice? |
+
+And the question you must always ask:
+
+> **"Does the client actually need to wait for this at all?"**
+
+If the answer is **yes** (a user is staring at a spinner), async made things *worse* — you added a queue, a polling loop, and a job table to achieve what a synchronous call did for free.
+
+Async backend processing pays off when the work is **long**, the client **has other things to do**, and the result **isn't needed immediately**.
+
+### Checkpoint
+
+1. Your client is non-blocking. Why is the system still doing synchronous processing?
+2. In the 5-minute handler, what is being held for those 5 minutes?
+3. What does the flipped handler return, and how fast?
+4. Why is `setTimeout` not a substitute for a queue?
+5. A local promise and a queue + job ID are structurally the same thing. What is the single difference in scope?
+6. Name four ways a client can learn an async job finished.
+7. Async processing "splits" request/response rather than removing it. What are the two exchanges?
+8. Your endpoint takes 300ms. Is a queue + job ID + polling the right design? Why or why not?
+
+---
+
 ## Clarification — What Is a File Descriptor (fd)?
 
 Unit 3 uses `fd` constantly, so it needs its own explanation. This is not a side note — **it is the mechanism Unit 3 is built on.**
@@ -1643,6 +1930,13 @@ The fd number for stdin/stdout in a shell: `ls -l /proc/self/fd`.
 | **The awkwardness test** | If the other party staying silent would be awkward → synchronous |
 | **Client property** | Only the waiting party can choose synchronicity; the responder has no say |
 | **Local optimisation** | Making your client async frees you but frees nobody else — the server and your callers still wait |
+| **Job ID** | A handle returned immediately so the client can collect a result later |
+| **Async backend processing** | Respond now with a handle, do the work in a background worker |
+| **202 Accepted** | HTTP status meaning "received and queued, not finished" |
+| **Background worker** | A process that drains the queue and performs queued work |
+| **Split exchange** | One long request/response become two short ones with a queue in the gap |
+| **Promise that outlived the process** | What a backend queue actually is |
+| **Delivery of the result** | The second half of an async design — polling, SSE, pub/sub, or WebSocket |
 
 ---
 
