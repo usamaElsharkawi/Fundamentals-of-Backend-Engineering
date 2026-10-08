@@ -15,7 +15,7 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 - **In progress:**
   - **Lecture 9 — Synchronous vs Asynchronous Workloads** ⏸️ paused
     - Units 1–7 studied ✅ | Units 8–10 explained only 📋 (revisit pending — 12 open questions logged)
-  - **Lecture 12 — Server Sent Events** 🔄 current — Unit 1 of 7 studied
+- **Next:** Lecture 12 — Server Sent Events (13min)
 - **Remaining:** 6 lectures
 
 ---
@@ -82,7 +82,7 @@ Lecture 12 (SSE, 13min) — already set up as the pattern that **crosses Axis 1*
   4. [9. Synchronous vs Asynchronous workloads](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) (43min)
   5. ✅ [10. Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) (14min)
   6. ✅ [11. Long Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) (10min)
-  7. 🔄 [12. Server Sent Events](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-12-sse.md) (13min) — Unit 1 of 7 studied
+  7. [12. Server Sent Events](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-12-sse.md) (13min)
   8. [13. Publish Subscribe (Pub/Sub)](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-13-pubsub.md) (17min)
   9. [14. Multiplexing vs Demultiplexing](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-14-multiplexing.md) (15min)
   10. [15. Stateful vs Stateless](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-15-stateful-vs-stateless.md) (23min)
