@@ -10,13 +10,35 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 
 ### Section 1: (Not started)
 ### Section 2: Backend Communication Design Patterns
-- **Progress:** 5 / 11 lectures complete | 4hr 17min total
-- **Completed:** Lecture 6 — Intro ✅, Lecture 7 — Request Response ✅, Lecture 8 — Push ✅, Lecture 10 — Polling ✅ (7 units), Lecture 11 — Long Polling ✅ (7 units)
+- **Progress:** 6 / 11 lectures complete | 4hr 30min total
+- **Completed:** Lecture 6 — Intro ✅, Lecture 7 — Request Response ✅, Lecture 8 — Push ✅, Lecture 10 — Polling ✅ (7 units), Lecture 11 — Long Polling ✅ (7 units), Lecture 12 — Server Sent Events ✅ (7 units)
 - **In progress:**
   - **Lecture 9 — Synchronous vs Asynchronous Workloads** ⏸️ paused
     - Units 1–7 studied ✅ | Units 8–10 explained only 📋 (revisit pending — 12 open questions logged)
-- **Next:** Lecture 12 — Server Sent Events (13min)
-- **Remaining:** 6 lectures
+- **Next:** Lecture 13 — Publish Subscribe (Pub/Sub) (17min)
+- **Remaining:** 5 lectures
+
+---
+
+## 💡 Working Preferences
+
+Recorded from the session so they survive across sessions.
+
+### Code alongside explanation
+**Boss likes seeing the actual code next to the explanation.** When teaching a mechanism —
+framing, event loops, timeouts, connection handling — show the real code snippet *in the same
+response* as the explanation. The code grounds the abstraction; the explanation gives it meaning.
+Don't separate them into "here's the theory" and "here's the code later."
+
+### How to apply
+- In each unit, include the relevant code block (server-side and client-side where both matter)
+- Explain *why each line is there*, not just what it does
+- Call out the lines that are load-bearing vs. cosmetic
+- If a line is wrong or missing (like Hussein's missing `onmessage` handler), say so
+
+### Why this works
+The boss learns by connecting code to mental models. A mechanism without code is a definition;
+code without explanation is a recipe. Both together build understanding.
 
 ---
 
@@ -26,7 +48,7 @@ This repository documents the journey through the "Fundamentals of Backend Engin
 
 The next session has one job: **recap the whole section, link the lectures into one model, and work the backlog.**
 
-### 1. Link the six lectures into one story
+### 1. Link the seven lectures into one story
 
 | # | Lecture | The idea it contributes |
 |---|---|---|
@@ -36,6 +58,7 @@ The next session has one job: **recap the whole section, link the lectures into 
 | 9 | Sync vs Async | **Blocked vs awaiting**: is the *thread* suspended, or just this function? |
 | 10 | Polling | Return a **handle**, not a result. Read **state**, not delivery |
 | 11 | Long Polling | Make the server **wait**. Safe only with a durable store |
+| 12 | SSE | One request, an **unending response** — real-time over plain HTTP, paid for with a held connection |
 
 ### 2. The spine to build toward
 
@@ -52,15 +75,16 @@ Two corrections we made to Lecture 10's ladder, plus the third axis found in Lec
 | SSE | Server | Always | Needs a protocol |
 | Pub/Sub | Broker | Never | Invisible |
 
-### 4. Work the backlog — **42 open ❓ , 10 already closed**
+### 4. Work the backlog — **45 open ❓ , 10 already closed**
 
 | Source | Open | Notes |
 |---|---|---|
 | [Lecture 9](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) | **12** | Units 8–10 still **explained only** — the biggest single debt |
 | [Lecture 10](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) | **8** | TTL, aliasing, autoscaling, the Unit 4.3/5.3 contradiction |
 | [Lecture 11](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) | **22** | Includes 3 carried-forward questions that **challenge our own conclusions** |
+| [Lecture 12](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-12-sse.md) | **3** | Backpressure for slow consumers, the demo's interval leak, HTTP/2 stream-limit defaults |
 
-Priority order: **Lecture 9 Units 8–10** → the 3 challenges to our own claims → TTL and retention → the rest.
+Priority order: **Lecture 9 Units 8–10** → the 3 challenges to our own claims → TTL and retention → Lecture 12's backpressure/disconnect questions → the rest.
 
 ### 5. The 3 questions that test our own reasoning
 
@@ -74,7 +98,7 @@ These are the most valuable — they question conclusions we asserted, not facts
 
 ### 6. Then continue
 
-Lecture 12 (SSE, 13min) — already set up as the pattern that **crosses Axis 1** from client to server.
+Lecture 13 (Pub/Sub, 17min) — the pattern that moves initiation from the client to a **broker**.
 - **Lectures:**
   1. ✅ [6. Backend Communication Design Patterns Intro](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-06-intro.md) (2min)
   2. ✅ [7. Request Response](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-07-request-response.md) (28min)
@@ -82,7 +106,7 @@ Lecture 12 (SSE, 13min) — already set up as the pattern that **crosses Axis 1*
   4. [9. Synchronous vs Asynchronous workloads](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-09-sync-vs-async.md) (43min)
   5. ✅ [10. Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-10-polling.md) (14min)
   6. ✅ [11. Long Polling](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-11-long-polling.md) (10min)
-  7. [12. Server Sent Events](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-12-sse.md) (13min)
+  7. ✅ [12. Server Sent Events](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-12-sse.md) (13min)
   8. [13. Publish Subscribe (Pub/Sub)](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-13-pubsub.md) (17min)
   9. [14. Multiplexing vs Demultiplexing](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-14-multiplexing.md) (15min)
   10. [15. Stateful vs Stateless](Section%202%3A%20Backend%20Communication%20Design%20Patterns/lecture-15-stateful-vs-stateless.md) (23min)
